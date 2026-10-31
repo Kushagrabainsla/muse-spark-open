@@ -1,0 +1,65 @@
+okc run 8770b04e6afa4157 on muse_moe_w4a16
+submission  /Users/kushagrabainsls/Desktop/projects/muse-spark-open/muse_moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     1.367378829550732
+speedup_ci  [1.346868147107471 1.387889511993993]
+score_us    9835.240760907976
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               80.06      45.15   1.773x      11.42  
+bs=16 load=decode 16 sharding=ep8                            187.20     142.37   1.315x      52.52  
+bs=32 load=decode 32 sharding=ep8                            210.13     200.76   1.047x      70.76  
+bs=8 load=verify 1 sharding=ep8                              145.98     104.98   1.391x      37.32  
+bs=128 load=verify 16 sharding=ep8                           470.78     330.18   1.426x     101.34  
+bs=256 load=verify 32 sharding=ep8                           620.91     459.63   1.351x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<1, 2, 0, false>(__nv_bfloat16 const*, float...      18.5 µs  50.3%      1
+void moe_gemm<1, 2, 1, false>(__nv_bfloat16 const*, float...      12.3 µs  33.4%      1
+norm_kernel(float*, float*, int const*, float const*, flo...       4.0 µs  11.0%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       2.0 µs   5.3%      1
+total                                                             36.7 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<1, 2, 0, false>(__nv_bfloat16 const*, float...      97.2 µs  61.4%      1
+void moe_gemm<1, 2, 1, false>(__nv_bfloat16 const*, float...      53.6 µs  33.8%      1
+norm_kernel(float*, float*, int const*, float const*, flo...       4.4 µs   2.8%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       3.2 µs   2.0%      1
+total                                                            158.4 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<2, 2, 0, false>(__nv_bfloat16 const*, float...     100.9 µs  59.8%      1
+void moe_gemm<2, 2, 1, false>(__nv_bfloat16 const*, float...      58.8 µs  34.8%      1
+norm_kernel(float*, float*, int const*, float const*, flo...       5.5 µs   3.3%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       3.6 µs   2.1%      1
+total                                                            168.9 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<1, 2, 0, false>(__nv_bfloat16 const*, float...      43.6 µs  54.5%      1
+void moe_gemm<1, 2, 1, false>(__nv_bfloat16 const*, float...      28.8 µs  36.1%      1
+norm_kernel(float*, float*, int const*, float const*, flo...       5.0 µs   6.2%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       2.5 µs   3.1%      1
+total                                                             79.8 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<2, 2, 0, false>(__nv_bfloat16 const*, float...     183.5 µs  61.8%      1
+void moe_gemm<2, 2, 1, false>(__nv_bfloat16 const*, float...      98.1 µs  33.0%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       8.1 µs   2.7%      1
+norm_kernel(float*, float*, int const*, float const*, flo...       7.2 µs   2.4%      1
+total                                                            296.9 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<2, 2, 0, false>(__nv_bfloat16 const*, float...     274.0 µs  61.2%      1
+void moe_gemm<2, 2, 1, false>(__nv_bfloat16 const*, float...     148.1 µs  33.1%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...      13.2 µs   3.0%      1
+norm_kernel(float*, float*, int const*, float const*, flo...      12.4 µs   2.8%      1
+total                                                            447.7 µs

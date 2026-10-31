@@ -1,0 +1,77 @@
+okc run 9e56c692773140b1 on muse_moe_w4a16
+submission  /Users/kushagrabainsls/Desktop/projects/muse-spark-open/muse_moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     1.4241166605322004
+speedup_ci  [1.4027549106242174 1.4454784104401832]
+score_us    9443.397702386417
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               80.66      41.53   1.942x      11.42  
+bs=16 load=decode 16 sharding=ep8                            187.76     139.23   1.349x      52.52  
+bs=32 load=decode 32 sharding=ep8                            204.06     189.94   1.074x      70.76  
+bs=8 load=verify 1 sharding=ep8                              140.66      96.20   1.462x      37.32  
+bs=128 load=verify 16 sharding=ep8                           460.26     315.86   1.457x     101.34  
+bs=256 load=verify 32 sharding=ep8                           622.00     447.03   1.391x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<1, 2, 0, false>(__nv_bfloat16 const*, float...      19.4 µs  41.0%      1
+void moe_gemm<1, 2, 1, false>(__nv_bfloat16 const*, float...      19.0 µs  40.2%      1
+norm_kernel(float*, float*, int const*, float const*, flo...       7.0 µs  14.8%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       1.9 µs   3.9%      1
+total                                                             47.3 µs
+GPU busy (kernels overlap: PDL or streams)                        34.2 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<1, 2, 0, false>(__nv_bfloat16 const*, float...      98.0 µs  48.2%      1
+void moe_gemm<1, 2, 1, false>(__nv_bfloat16 const*, float...      88.2 µs  43.3%      1
+norm_kernel(float*, float*, int const*, float const*, flo...      14.2 µs   7.0%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       3.1 µs   1.5%      1
+total                                                            203.5 µs
+GPU busy (kernels overlap: PDL or streams)                       156.0 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<2, 2, 0, false>(__nv_bfloat16 const*, float...     124.6 µs  49.1%      1
+void moe_gemm<2, 2, 1, false>(__nv_bfloat16 const*, float...     110.8 µs  43.7%      1
+norm_kernel(float*, float*, int const*, float const*, flo...      14.2 µs   5.6%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       3.9 µs   1.6%      1
+total                                                            253.6 µs
+GPU busy (kernels overlap: PDL or streams)                       197.9 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<1, 2, 0, false>(__nv_bfloat16 const*, float...      44.6 µs  42.9%      1
+void moe_gemm<1, 2, 1, false>(__nv_bfloat16 const*, float...      42.7 µs  41.1%      1
+norm_kernel(float*, float*, int const*, float const*, flo...      14.3 µs  13.8%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       2.4 µs   2.3%      1
+total                                                            104.0 µs
+GPU busy (kernels overlap: PDL or streams)                        77.0 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<2, 2, 0, false>(__nv_bfloat16 const*, float...     178.8 µs  48.8%      1
+void moe_gemm<2, 2, 1, false>(__nv_bfloat16 const*, float...     155.4 µs  42.4%      1
+norm_kernel(float*, float*, int const*, float const*, flo...      24.1 µs   6.6%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...       8.0 µs   2.2%      1
+total                                                            366.3 µs
+GPU busy (kernels overlap: PDL or streams)                       287.5 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void moe_gemm<2, 2, 0, false>(__nv_bfloat16 const*, float...     300.4 µs  50.1%      1
+void moe_gemm<2, 2, 1, false>(__nv_bfloat16 const*, float...     256.0 µs  42.7%      1
+norm_kernel(float*, float*, int const*, float const*, flo...      29.6 µs   4.9%      1
+route_kernel(int const*, int, int, int, int, int, int*, i...      13.4 µs   2.2%      1
+total                                                            599.4 µs
+GPU busy (kernels overlap: PDL or streams)                       483.7 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
