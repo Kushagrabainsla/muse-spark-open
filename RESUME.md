@@ -5,7 +5,7 @@ Project overview, layout and lessons: [README.md](README.md). This file is the w
 ## Where things stand
 | Problem | Board | Job | Local file |
 |---|---|---|---|
-| muse_bf16_proj | 1.175× (rank 1096 of 1502; median 1.24×) | 4ed4a00394264da9 | muse_bf16_proj/submission.py (= submitted E8) |
+| muse_bf16_proj | 1.190× (2026-10-31) | fef2017d39ec4cc2 | muse_bf16_proj/submission.py (= submitted E14) |
 | muse_moe_w4a16 | **1.704× (rank 688 of 1206)** | 069f543bb3604714 | muse_moe_w4a16/submission.py (= submitted M22) |
 | muse_decode_layer | **1.425× (rank 703 of 1072)** | 66246e98c53c47a8 | muse_decode_layer/submission.py (L8 = A14 + M22) |
 | muse_attention_decode | **1.525× (rank 754 of 1152)** | 09b49ea4276e4306 | muse_attention_decode/submission.py (A14 = submitted) |
@@ -16,6 +16,12 @@ Full experiment history: `muse_bf16_proj/EXPERIMENTS.md` (E0–E13), `muse_moe_w
 `muse_decode_layer/EXPERIMENTS.md` (L1–L6), `muse_attention_decode/EXPERIMENTS.md` (A1–A15). The layer is
 generated from the three kernel files (attention, proj, moe): rerun `python3 muse_decode_layer/build_layer.py`
 after changing any of them. muse_prefill_layer is not entered.
+
+## 2026-10-31: no pod (user: do NOT use RunPod); every test is an `okc check`
+- Tools: `okc check <problem> <file> --no-wait`, then `okc status <job> --wait --json`; per-shape times and the
+  per-kernel profile come back. A local compare script printed SGLang / ours per shape against a base job.
+- Proj E14: cluster tail pushed at MT = 1 + qkv config: board 1.175 -> 1.190×. Attention A16 (FA3 splits, page-table
+  batching, chunk 256, CUDA full verify bs1): nothing kept. Tuning is exhausted; big levers need new kernels.
 
 ## 2026-10-30 (00:07–23:45 UTC): attention
 - A11: sliding decode steps in one launch (attnc: prep + attention + cluster/DSMEM merge): board 1.391 -> 1.473×.

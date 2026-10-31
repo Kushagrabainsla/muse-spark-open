@@ -126,6 +126,16 @@ Pure-read best configs use ~2000 short CTAs. The pure-read time is the practical
 - Slower than 12-bit (qkv m=1 13.4, pooler 20.6: the extra 2-byte loads + ops), and still not lossless on these
   weights (a few qkv / pooler weights below 32 binades), so every layer would fall back.
 
+### E14 — tested with `okc check` only (no pod), 2026-10-31
+- Configs (two checks): qkv at MT = 1 as (1, 16, 1, 4) (E12's finding): m = 1 12.25 -> ~11.7–12.0 µs, kept. The skinny
+  kernel for `o` (2, 8, 1, 1) / (1, 8, 1, 1) / (2, 4, 1, 2) and for the whole unpooler at m = 16 / 32 is far slower
+  than cuBLAS (o m = 16: 10.2 vs 6.5 µs; unpooler m = 32: 27.2 vs 18.5): cuBLAS stays.
+- Cluster tail pushed: each CTA stores its partial of element i straight into its reducer's shared memory
+  (st.shared::cluster), one cluster barrier, then local sums (no remote reads, no second barrier). For every MT:
+  1.1874×; MT = 1 only (the old pull above): 1.1790× — both inside the ±1.5 % interval of each other; small-m
+  shapes gain 0.2–0.9 µs (unpooler m = 8 5.7 -> 4.8–5.2, router m = 8 6.8 -> 6.0–6.1). Kept: push at MT = 1.
+- **Submitted: job fef2017d39ec4cc2, 1.190× (1.173–1.208)** (from 1.175×). submission_e14.py = this.
+
 ## Next
 - The small-m loads (4 of 6) are where the geomean moves: the tail (~1–1.6 µs per small weight) and `o` (cuBLAS
   6.8 µs vs 5.5 plain read). Ideas not yet tried: a cheaper cluster tail (one cluster.sync + barrier.cluster.arrive

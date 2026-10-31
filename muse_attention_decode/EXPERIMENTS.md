@@ -222,6 +222,15 @@ size 1 → every key a scattered 64-byte gather per head). Board: leader 3.03×,
   bs1 28.4 vs 27.6, bs16 119.8 vs 115.4, bs32 223 vs 214 µs: no better than the Triton combine. Both reverted
   (kept as submission_a15_fullattnc.py / submission_a15_cudamerge.py).
 
+### A16 — tested with `okc check` only (no pod), 2026-10-31 — nothing kept
+- FA3 num_splits (explicit, per shape): full verify bs1 16 -> 55.0 µs (heuristic 30.9), 64 -> 30.7; bs16 4 / 16 ->
+  198.8 / 197.5 (200.0); bs32 2 / 8 -> 383.5 / 382.8 (384.5); sliding verify bs32 2 or 8 -> 28.15 (29.2). ~1 %:
+  not worth it.
+- attn_kernel's page-table rows loaded eight in flight per thread and in two parts (as attnpc): slower (full bs16
+  116 -> 128, bs32 215 -> 234 µs): the plain loop was not the bottleneck there.
+- Full decode bs1 with 256-key chunks: 27.5 -> 31.8 µs. Full verify bs1 on the CUDA kernel (attnpc) instead of FA3:
+  30.9 -> 34.0 µs.
+
 ## Next
 - Full verify ties FA3 now (kernel 186–195 µs vs 198 at bs16; the one-head copy floor is ~159 µs). What is left:
   the consumer chain (~1500 cycles/stage: softmax on MUFU/F2FP, two wgmma issues, barrier); options are exp2 for

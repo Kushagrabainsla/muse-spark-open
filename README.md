@@ -15,7 +15,7 @@ than SGLang's on the same inputs. The kernel track closes **2026-11-04, 11:59 pm
 | [muse_attention_decode](muse_attention_decode) | gated attention decode over a paged FP8 cache | **1.525×** | 754 / 1152 | 1.79× | 3.22× | 09b49ea4276e4306 |
 | [muse_moe_w4a16](muse_moe_w4a16) | routed experts, NVFP4 weights | **1.704×** | 688 / 1206 | 1.81× | 2.76× | 069f543bb3604714 |
 | [muse_decode_layer](muse_decode_layer) | the whole decoder layer | **1.425×** | 703 / 1072 | 1.66× | 2.42× | 66246e98c53c47a8 |
-| [muse_bf16_proj](muse_bf16_proj) | dense BF16 projections (skinny GEMMs) | **1.175×** | 1096 / 1502 | 1.24× | 1.65× | 4ed4a00394264da9 |
+| [muse_bf16_proj](muse_bf16_proj) | dense BF16 projections (skinny GEMMs) | **1.190×** | 1096 / 1502 | 1.24× | 1.65× | fef2017d39ec4cc2 |
 | overall kernel board | the 4 problems as one decode step | | 722 / 1722 | | | |
 
 Speedup = geometric mean over the problem's loads (decode / verify at batch 1, 16, 32 and so on) of SGLang's
@@ -43,9 +43,9 @@ attention, MoE and projection submissions into SGLang's layer. Rerun it after ch
 
 ## How we work
 
-1. **GPU:** a RunPod H200 SXM pod named `okc-musespark-*` (image `lmsysorg/sglang:dev-muse-spark-open`, 120 GB disk,
-   SSH). Budget: at most $70 per UTC day; check `date -u` and the bill every hour, stop the pod when idle.
-   An H100 is not a valid stand-in (MoE results did not carry over).
+1. **GPU:** since 2026-10-31 every test is an `okc check` (the judge's own H200: correctness, per-shape times and a
+   per-kernel profile; 20 per problem per day). Before that, a RunPod H200 SXM pod (`okc-musespark-*`, image
+   `lmsysorg/sglang:dev-muse-spark-open`) for profiling. An H100 is not a valid stand-in (MoE results did not carry over).
 2. **Copy** the problem folder to the pod (`/root/okc_<problem>`), run `bench.py --check` there. Local numbers track
    the judge within a few percent.
 3. **Submit** with `~/.okc/bin/okc submit <problem>/submission.py` when the pod shows a clear gain (~3 %) and 0 check
