@@ -45,6 +45,11 @@ timing over the 12 scored shapes (6 loads, weights 46 / 16) and the 13 tests, us
 - L8 (A14: + sliding verify in one launch, decode merge pushed): pod 1.509×; **submitted job 66246e98c53c47a8,
   1.425×**, rank 701 / 1069. build_layer.py now maps any "muse_attn_decode*" module name.
 
+### L9 — rebuilt with projections E14 (okc check, 2026-10-31) — not submitted
+- Check 1.410× vs L8's board 1.425×: decode shapes 1–5 µs faster, but bs256 verify shapes 30–40 µs slower on code
+  that did not change (cuBLAS, MoE, attention): run-to-run machine variance of a few % per shape. Local
+  submission.py = L9 (L8 + E14).
+
 ## Next
 - Full verify blocks are now the slowest shapes (1.21–1.24×): attention there is still FA3 (the CUDA kernel
   loses on q_len 8, see muse_attention_decode A8). A wgmma verify kernel would lift both problems.

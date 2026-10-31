@@ -213,6 +213,11 @@ that seed's routing (75% of its routes and touched experts).
 - **Submitted: job 069f543bb3604714, 1.704× (1.678–1.729), rank 581** (from 1.642×). Local submission.py = M22;
   submission_m16.py = M16. Intermediates: submission_r.py (routing in both gemms), submission_r2.py (gemm1 publishes).
 
+### M23 — deeper weight ring (okc check only, no pod), 2026-10-31 — dead
+- STG 3 / 4 two-step stages per warp (more weight bytes in flight; the smem then allows 1 CTA per SM instead of 2):
+  1.525× / 1.502× vs M22's 1.704× (bs32 166 -> 182 / 188 µs, bs256 368 -> 433 / 431). The kernel needs its 16 warps
+  per SM more than deeper prefetch: any idea that costs the second CTA per SM loses.
+
 ## Next
 00. (M22) The remaining skeleton: split-K atomics (up to +3.5 % if free; v4 atomics lost on the H200), the norm
    kernel (4–13 µs), x staging + per-run syncs. A 9-op decode layout (vs 11) is worth ~+0.7 % at most.

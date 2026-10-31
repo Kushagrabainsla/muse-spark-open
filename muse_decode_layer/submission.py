@@ -2579,6 +2579,15 @@ __device__ __forceinline__ void mma_16816(float* c, uint32_t a0, uint32_t a1, ui
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ uint32_t dsmem_addr(const void* p, int rank) {  // p in CTA `rank` of the cluster
+  uint32_t r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"((uint32_t)__cvta_generic_to_shared(p)), "r"(rank));
+  return r;
+}
+__device__ __forceinline__ void st_dsmem(uint32_t a, float v) {
+  asm volatile("st.shared::cluster.f32 [%0], %1;" ::"r"(a), "f"(v) : "memory");
+}
+
 // Weights are read once: don't keep them in L1.
 __device__ __forceinline__ uint4 ld_stream(const void* p) {
   uint4 r;
@@ -2597,7 +2606,11 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
                                                      void* __restrict__ out, int M, int N, int K, int S) {
   constexpr int BN = 16 * RT, TK = 8 * MT, ELEMS = BN * TK;
   __shared__ float red[4][ELEMS];
-  __shared__ float part[ELEMS];
+  // Element i (in blocks of 128) is reduced by CTA (i / 128) % S, at local index li = (i / 128 / S) * 128 + i % 128.
+  // MT = 1: every CTA of the cluster pushes its partial there, slot rank * EPO + li (EPO <= ELEMS / S + 127); larger
+  // tiles (more partials per thread) pull them after the barrier instead, which measured faster for them.
+  constexpr bool PUSH = MT == 1;
+  __shared__ float rcv[PUSH ? ELEMS + 128 * 16 : ELEMS];
 
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
@@ -2670,20 +2683,41 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
         red[warp][tok * BN + row] = acc[rt][mt][c];
       }
   __syncthreads();
-  for (int i = threadIdx.x; i < ELEMS; i += 128) part[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
-
-  cluster.sync();
-  // Each CTA of the cluster reduces every S-th element across the cluster and writes it.
-  for (int i = rank * 128 + threadIdx.x; i < ELEMS; i += S * 128) {
-    const int tok = i / BN, row = i % BN;
-    if (tok >= M) continue;
-    float sum = 0.f;
-    for (int r = 0; r < S; ++r) sum += cluster.map_shared_rank(part, r)[i];
-    const size_t o = (size_t)tok * N + n0 + row;
-    if constexpr (OUT_F32) reinterpret_cast<float*>(out)[o] = sum;
-    else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(sum);
+  if constexpr (PUSH) {
+    // The CTA's partial of element i goes straight into its reducer's shared memory (DSMEM stores need no wait), so
+    // one cluster barrier suffices and the reduction reads only local memory.
+    const int EPO = (ELEMS + 128 * S - 1) / (128 * S) * 128;
+    for (int i = threadIdx.x; i < ELEMS; i += 128) {
+      const int blk = i >> 7, li = blk / S * 128 + (i & 127);
+      st_dsmem(dsmem_addr(rcv + rank * EPO + li, blk % S), red[0][i] + red[1][i] + red[2][i] + red[3][i]);
+    }
+    cluster.sync();  // every partial has landed; nothing reads another CTA's memory after this
+    for (int li = threadIdx.x; li < EPO; li += 128) {
+      const int i = ((li >> 7) * S + rank) * 128 + (li & 127);
+      if (i >= ELEMS) continue;
+      const int tok = i / BN, row = i % BN;
+      if (tok >= M) continue;
+      float sum = 0.f;
+      for (int r = 0; r < S; ++r) sum += rcv[r * EPO + li];
+      const size_t o = (size_t)tok * N + n0 + row;
+      if constexpr (OUT_F32) reinterpret_cast<float*>(out)[o] = sum;
+      else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(sum);
+    }
+  } else {
+    for (int i = threadIdx.x; i < ELEMS; i += 128) rcv[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
+    cluster.sync();
+    // Each CTA of the cluster reduces every S-th block of 128 elements across the cluster and writes it.
+    for (int i = rank * 128 + threadIdx.x; i < ELEMS; i += S * 128) {
+      const int tok = i / BN, row = i % BN;
+      if (tok >= M) continue;
+      float sum = 0.f;
+      for (int r = 0; r < S; ++r) sum += cluster.map_shared_rank(rcv, r)[i];
+      const size_t o = (size_t)tok * N + n0 + row;
+      if constexpr (OUT_F32) reinterpret_cast<float*>(out)[o] = sum;
+      else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(sum);
+    }
+    cluster.sync();  // keep this CTA's shared memory alive until the others have read it
   }
-  cluster.sync();  // keep this CTA's shared memory alive until the others have read it
 }
 
 template <int MT, int RT, int NSTEPS, int CH, bool LO>
@@ -2745,7 +2779,7 @@ def _proj_mt(m: int) -> int:
 # CTAs per cluster (K = 128 * NSTEPS * CH * S). From sweeps on an H200 under CUDA graphs with a cold L2;
 # shapes not listed (o, the whole unpooler) are faster in cuBLAS.
 _proj_CONFIGS = {
-    ("qkv_gate", 1): (2, 8, 1, 8), ("qkv_gate", 2): (2, 4, 2, 8), ("qkv_gate", 4): (2, 4, 4, 4),
+    ("qkv_gate", 1): (1, 16, 1, 4), ("qkv_gate", 2): (2, 4, 2, 8), ("qkv_gate", 4): (2, 4, 4, 4),
     ("pooler", 1): (2, 8, 2, 4), ("pooler", 2): (2, 4, 4, 4), ("pooler", 4): (2, 4, 8, 2),
     ("unpooler", 1): (1, 4, 1, 8),
     ("router", 1): (1, 2, 2, 16), ("router", 2): (1, 4, 1, 16), ("router", 4): (2, 4, 1, 16),
