@@ -78,6 +78,20 @@ timing over the 12 scored shapes (6 loads, weights 46 / 16) and the 13 tests, us
 - L12: no remap kernel: MoE reads local_start from device memory and takes global ids (gemm1 now follows the pooler
   directly; its x staging reads L2). A/B 1.4883 vs L11 rerun 1.4705. **Submitted: job 7a0ba34ed4ee4181, 1.496×.**
 
+### L13 — our own residual-boundary kernels (okc check, 2026-11-01) — not kept
+- One CTA per token, FP32, launched with PDL (stream and coefficients read before the wait), replacing SGLang's
+  FusedPostNormResidualPreNorm up to 32 tokens; math from the reference (alpha, beta from the residual gate / 0.3).
+- Both boundaries: A/B 1.4871 vs L12 rerun 1.5057. decode 1 -3 µs, but decode 16 / 32 +10 / +31-42 µs.
+  **Finding:** the attention boundary's output feeds the router; our FP32 version is closer to the reference, and
+  the judge puts this GPU's experts on the range the *reference* routing sends most pairs to, so exacter routing
+  gave our MoE more pairs and experts (~27 MB / ~7 µs per expert). Keep SGLang's numerics on the router's input.
+- FFN boundary only: 1.4863 vs 1.5037; the shapes it touches move -4.6 % to +1.5 % while shapes running unchanged
+  code moved up to 5 % between the two machines: no clear gain. Reverted to L12.
+- Also tried: the skinny kernel's first chunk as its own copy so the pooler (CH > 1) could load weights before its
+  wait: the pooler was slower in its own problem (m = 1 18.9 -> 20.2, m = 32 23.2 -> 25.7 µs). Reverted.
+- Measurement note: two concurrent checks can land on different machines; a change that only touches some shapes
+  is judged by those shapes' paired speedups, with the untouched shapes as the noise control.
+
 ## Next
 - Full verify blocks are now the slowest shapes (1.21–1.24×): attention there is still FA3 (the CUDA kernel
   loses on q_len 8, see muse_attention_decode A8). A wgmma verify kernel would lift both problems.

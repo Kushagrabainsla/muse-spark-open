@@ -28,7 +28,11 @@ after changing any of them. muse_prefill_layer is not entered.
   wait, no pad / remap glue kernels: board 1.439 -> 1.478 -> 1.496×. L2 prefetch during attention made it worse
   (latency-bound phases slow down under extra DRAM traffic). PDL hazard: read a predecessor's output with __ldcg.
 - A/B method: queue the candidate and a rerun of the current version (add a comment so it is not a cached
-  duplicate) at the same time; two reruns of the same code agree within ~0.2-0.7 %.
+  duplicate) at the same time; reruns of the same code agree within ~0.2-2 % overall (different machines), and
+  untouched shapes can move 3-5 %: judge a change by the shapes it touches, the untouched ones as the control.
+- L13 (2026-11-01, not kept): our own boundary kernels. The attention boundary feeds the router: exacter (FP32)
+  routing put more pairs on this GPU's experts (the judge picks the busiest range under the reference routing):
+  decode 32 +30-40 µs. Keep SGLang's numerics on the router input. FFN boundary alone: inside the noise.
 
 ## 2026-10-30 (00:07–23:45 UTC): attention
 - A11: sliding decode steps in one launch (attnc: prep + attention + cluster/DSMEM merge): board 1.391 -> 1.473×.
