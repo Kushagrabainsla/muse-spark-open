@@ -218,6 +218,12 @@ that seed's routing (75% of its routes and touched experts).
   1.525× / 1.502× vs M22's 1.704× (bs32 166 -> 182 / 188 µs, bs256 368 -> 433 / 431). The kernel needs its 16 warps
   per SM more than deeper prefetch: any idea that costs the second CTA per SM loses.
 
+### M24 — optional pre-expert RMSNorm in gemm1's staging (for the decode layer), 2026-10-31
+- moe_forward takes (pre_ss, pre_w, pre_eps): when set, gemm1 normalizes x as it stages it (per-token sum of
+  squares from the layer's pooler) and the norm kernel zeroes pre_ss. Off in this problem (empty tensors): check
+  1.677× (board M22 1.704×; bs1–128 within 1.5 %, bs256 395 vs 368 µs, like the machine variance seen on unchanged
+  code). Not resubmitted here; the board stays M22 (submission_m22.py = M22 exactly). See muse_decode_layer L10.
+
 ## Next
 00. (M22) The remaining skeleton: split-K atomics (up to +3.5 % if free; v4 atomics lost on the H200), the norm
    kernel (4–13 µs), x staging + per-run syncs. A 9-op decode layout (vs 11) is worth ~+0.7 % at most.

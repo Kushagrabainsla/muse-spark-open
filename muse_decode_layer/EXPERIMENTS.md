@@ -50,6 +50,17 @@ timing over the 12 scored shapes (6 loads, weights 46 / 16) and the 13 tests, us
   that did not change (cuBLAS, MoE, attention): run-to-run machine variance of a few % per shape. Local
   submission.py = L9 (L8 + E14).
 
+### L10 — the pre-expert RMSNorm folded into the pooler and gemm1 (okc check, 2026-10-31)
+- Idea (from the thesis's I-172 finding that standalone norm / quant kernels cost device time): the layer ran the
+  pre-expert norm as its own F.rms_norm (6.2 µs at decode 32). Up to 32 tokens the pooler is our skinny kernel: its
+  write-out now also adds each token's sum of squares of the BF16 outputs to a small FP32 buffer (one atomic per
+  token per tile, after a warp shuffle); MoE gemm1 applies x * rsqrt(ss / K + eps) * (1 + w), rounded to BF16, as
+  it stages x; the MoE norm kernel zeroes the buffer for the next call. Above 32 tokens nothing changes.
+- Check: 1.4316× vs L9's 1.4101× (same day): decode 1 sliding 105.3 -> 100.0 µs, full 123.1 -> 117.3, decode 16
+  full 278.5 -> 275.7, verify 1 full 197.2 -> 195.1. Standalone proj / MoE checks pass (1.187× / 1.677×: the
+  options are off there).
+- **Submitted: job 2ef27c0f07a84d2d, 1.439× (1.417–1.461)** (from 1.425×).
+
 ## Next
 - Full verify blocks are now the slowest shapes (1.21–1.24×): attention there is still FA3 (the CUDA kernel
   loses on q_len 8, see muse_attention_decode A8). A wgmma verify kernel would lift both problems.

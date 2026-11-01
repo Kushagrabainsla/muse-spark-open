@@ -136,6 +136,10 @@ Pure-read best configs use ~2000 short CTAs. The pure-read time is the practical
   shapes gain 0.2–0.9 µs (unpooler m = 8 5.7 -> 4.8–5.2, router m = 8 6.8 -> 6.0–6.1). Kept: push at MT = 1.
 - **Submitted: job fef2017d39ec4cc2, 1.190× (1.173–1.208)** (from 1.175×). submission_e14.py = this.
 
+### E15 — optional per-token sum of squares in the write-out (for the decode layer), 2026-10-31
+- skinny(..., ssq): with a buffer, each BF16 output's square is added to ssq[token] (BN-lane shuffle, one atomic
+  per token per tile). Off in this problem: check 1.1866× (E14 1.179–1.187×). Not resubmitted.
+
 ## Next
 - The small-m loads (4 of 6) are where the geomean moves: the tail (~1–1.6 µs per small weight) and `o` (cuBLAS
   6.8 µs vs 5.5 plain read). Ideas not yet tried: a cheaper cluster tail (one cluster.sync + barrier.cluster.arrive

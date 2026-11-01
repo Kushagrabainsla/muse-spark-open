@@ -78,6 +78,10 @@ rest = rest.replace('''    del freqs
     state["moe"] = _moe_prepare({"w13": weights["w13"], "w13_sf": weights["w13_sf"], "w13_gs": weights["w13_gs"],
                                  "w2": weights["w2"], "w2_sf": weights["w2_sf"], "w2_gs": weights["w2_gs"],
                                  "post_norm_w": weights["post_expert_norm"]})
+    # The pre-expert RMSNorm folded into the pooler and gemm1 (up to SKINNY_MAX_M tokens): per-token sums of squares
+    # (zero between calls: the MoE's norm kernel re-zeroes them) and the FP32 (1 + w).
+    state["pre_ss"] = torch.zeros(256, dtype=torch.float32, device=device)
+    state["pre_w"] = (1.0 + weights["pre_expert_norm"].float()).contiguous()
     torch.cuda.synchronize()
     return state''')
 assert "_proj_prepare" in rest
@@ -140,13 +144,19 @@ repl = [
     ('    attn_output = _gemm(o, dense["o"])  # all-reduce: identity',
      '    attn_output = ' + proj_call("o", "o", 'dense["o"].shape[0]', 'state["proj"]') + '  # all-reduce: identity'),
     ('    expert_input = _gemm(ffn_input, dense["pooler"])',
-     '    expert_input = ' + proj_call("ffn_input", "pooler", 'dense["pooler"].shape[0]', 'state["proj"]')),
+     '''    # Where the pooler is the skinny kernel, it also sums each token's squares and gemm1 applies the pre-expert
+    # RMSNorm as it stages x (one kernel fewer); elsewhere the norm runs on its own, as SGLang does.
+    fold_norm = _proj_config("pooler", tokens) is not None
+    expert_input = _proj_kernel_fn({"x": ffn_input, "config": {"m": ffn_input.shape[0], "n": dense["pooler"].shape[0],
+                                    "k": ffn_input.shape[1], "layer": "pooler"},
+                                    **({"ssq": state["pre_ss"]} if fold_norm else {})}, state["proj"])'''),
     ('''            logits = torch.mm(ffn_input, state["router_hi_t"], out_dtype=torch.float32)
             logits += torch.mm(ffn_input, state["router_lo_t"], out_dtype=torch.float32)''',
      '''            logits = ''' + proj_call("ffn_input", "router", "256", 'state["proj"]')),
     ('''    expert_output = _experts(state["pre_expert_norm"](expert_input), topk_weights, local_ids, state)''',
      '''    expert_output = _moe_kernel_fn({
-        "hidden_states": state["pre_expert_norm"](expert_input).contiguous(),
+        "hidden_states": expert_input if fold_norm else state["pre_expert_norm"](expert_input).contiguous(),
+        "pre_norm": (state["pre_ss"], state["pre_w"], RMS_EPS) if fold_norm else None,
         "topk_ids": local_ids.to(torch.int32).contiguous(),
         "topk_weights": topk_weights.to(torch.float32).contiguous(),
         "config": {"bs": tokens, "d_hidden": D_EXPERT, "d_expert": D_EXPERT, "n_experts": N_EXPERTS,

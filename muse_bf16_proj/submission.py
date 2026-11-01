@@ -130,6 +130,26 @@ __device__ __forceinline__ uint4 ld_stream(const void* p) {
   return r;
 }
 
+// Writes one output (FP32, or rounded to BF16). With ssq (the decode layer's pooler), also adds each token's sum of
+// squares of its rounded outputs to ssq[token]: the BN lanes holding one token's outputs (aligned, one warp) sum
+// theirs by shuffles and the first adds them, so the next kernel can apply an RMSNorm without another pass.
+template <bool OUT_F32, int BN>
+__device__ __forceinline__ void store_out(void* out, float* ssq, bool ok, int tok, size_t o, float sum) {
+  if constexpr (OUT_F32) {
+    if (ok) reinterpret_cast<float*>(out)[o] = sum;
+  } else {
+    const __nv_bfloat16 v = __float2bfloat16(sum);
+    if (ok) reinterpret_cast<__nv_bfloat16*>(out)[o] = v;
+    if (ssq != nullptr) {
+      const float f = __bfloat162float(v);
+      float sq = ok ? f * f : 0.f;
+#pragma unroll
+      for (int x = 1; x < BN; x <<= 1) sq += __shfl_xor_sync(0xffffffffu, sq, x);
+      if (ok && (threadIdx.x & (BN - 1)) == 0) atomicAdd(ssq + tok, sq);
+    }
+  }
+}
+
 // out[M, N] = x[M, K] @ W[N, K]^T (+ x @ Wlo^T). Grid: (N / BN) * S CTAs of 128 threads, clusters of S
 // along x; CTA rank r, warp w covers k in [(4r + w) * 32 * NSTEPS * CH, +32 * NSTEPS * CH), as CH chunks of
 // NSTEPS 32-wide steps. Each chunk's loads are all issued before its MMAs; other resident warps hide the wait.
@@ -137,8 +157,10 @@ template <int MT, int RT, int NSTEPS, int CH, bool LO, bool OUT_F32>
 __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __restrict__ x,
                                                      const __nv_bfloat16* __restrict__ w,
                                                      const __nv_bfloat16* __restrict__ wlo,
-                                                     void* __restrict__ out, int M, int N, int K, int S) {
+                                                     void* __restrict__ out, int M, int N, int K, int S,
+                                                     float* __restrict__ ssq) {
   constexpr int BN = 16 * RT, TK = 8 * MT, ELEMS = BN * TK;
+  static_assert(BN == 16 || BN == 32, "a token's BN outputs are BN consecutive lanes of one warp");
   __shared__ float red[4][ELEMS];
   // Element i (in blocks of 128) is reduced by CTA (i / 128) % S, at local index li = (i / 128 / S) * 128 + i % 128.
   // MT = 1: every CTA of the cluster pushes its partial there, slot rank * EPO + li (EPO <= ELEMS / S + 127); larger
@@ -226,36 +248,34 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
       st_dsmem(dsmem_addr(rcv + rank * EPO + li, blk % S), red[0][i] + red[1][i] + red[2][i] + red[3][i]);
     }
     cluster.sync();  // every partial has landed; nothing reads another CTA's memory after this
-    for (int li = threadIdx.x; li < EPO; li += 128) {
+    for (int li = threadIdx.x; li < EPO; li += 128) {  // every thread runs the same count (EPO % 128 == 0)
       const int i = ((li >> 7) * S + rank) * 128 + (li & 127);
-      if (i >= ELEMS) continue;
       const int tok = i / BN, row = i % BN;
-      if (tok >= M) continue;
+      const bool ok = i < ELEMS && tok < M;
       float sum = 0.f;
-      for (int r = 0; r < S; ++r) sum += rcv[r * EPO + li];
-      const size_t o = (size_t)tok * N + n0 + row;
-      if constexpr (OUT_F32) reinterpret_cast<float*>(out)[o] = sum;
-      else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(sum);
+      if (ok)
+        for (int r = 0; r < S; ++r) sum += rcv[r * EPO + li];
+      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * N + n0 + row, sum);
     }
   } else {
     for (int i = threadIdx.x; i < ELEMS; i += 128) rcv[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
     cluster.sync();
     // Each CTA of the cluster reduces every S-th block of 128 elements across the cluster and writes it.
-    for (int i = rank * 128 + threadIdx.x; i < ELEMS; i += S * 128) {
+    for (int i = rank * 128 + threadIdx.x; i < ELEMS; i += S * 128) {  // the same count for every thread
       const int tok = i / BN, row = i % BN;
-      if (tok >= M) continue;
+      const bool ok = tok < M;
       float sum = 0.f;
-      for (int r = 0; r < S; ++r) sum += cluster.map_shared_rank(rcv, r)[i];
-      const size_t o = (size_t)tok * N + n0 + row;
-      if constexpr (OUT_F32) reinterpret_cast<float*>(out)[o] = sum;
-      else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(sum);
+      if (ok)
+        for (int r = 0; r < S; ++r) sum += cluster.map_shared_rank(rcv, r)[i];
+      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * N + n0 + row, sum);
     }
     cluster.sync();  // keep this CTA's shared memory alive until the others have read it
   }
 }
 
 template <int MT, int RT, int NSTEPS, int CH, bool LO>
-void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& wlo, torch::Tensor& out, int S) {
+void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& wlo, torch::Tensor& out, int S,
+            float* ssq) {
   const int M = x.size(0), K = x.size(1), N = out.size(1);
   auto kernel = skinny_kernel<MT, RT, NSTEPS, CH, LO, LO>;
   static bool attr_set = false;
@@ -276,20 +296,22 @@ void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor&
   cfg.numAttrs = 1;
   cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
                      reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
-                     reinterpret_cast<const __nv_bfloat16*>(wlo.data_ptr()), out.data_ptr(), M, N, K, S);
+                     reinterpret_cast<const __nv_bfloat16*>(wlo.data_ptr()), out.data_ptr(), M, N, K, S, ssq);
 }
 
 void skinny(torch::Tensor x, torch::Tensor w, torch::Tensor wlo, torch::Tensor out, int64_t mt, int64_t rt,
-            int64_t ns, int64_t ch, bool lo, int64_t s) {
+            int64_t ns, int64_t ch, bool lo, int64_t s, torch::Tensor ssq) {
+  float* sq = ssq.numel() ? ssq.data_ptr<float>() : nullptr;
+  TORCH_CHECK(!sq || (!lo && ssq.numel() >= x.size(0)), "skinny: sum of squares only for BF16 outputs");
 #define CASE(MT, RT, NS, CH, LO) \
-  if (mt == MT && rt == RT && ns == NS && ch == CH && lo == LO) return launch<MT, RT, NS, CH, LO>(x, w, wlo, out, s);
+  if (mt == MT && rt == RT && ns == NS && ch == CH && lo == LO) return launch<MT, RT, NS, CH, LO>(x, w, wlo, out, s, sq);
   CASES
   TORCH_CHECK(false, "no skinny kernel for this config");
 }
 """
 
 CPP_SRC = ("void skinny(torch::Tensor x, torch::Tensor w, torch::Tensor wlo, torch::Tensor out, int64_t mt, "
-           "int64_t rt, int64_t ns, int64_t ch, bool lo, int64_t s);")
+           "int64_t rt, int64_t ns, int64_t ch, bool lo, int64_t s, torch::Tensor ssq);")
 
 _mod = None
 
@@ -342,11 +364,11 @@ def _packed(state, name, rt, ns, ch, s):
     return state["packed"][key]
 
 
-def _launch(x, name, lo_name, cfg, out, state):
+def _launch(x, name, lo_name, cfg, out, state, ssq=None):
     mt, rt, ns, ch, s = cfg
     w = _packed(state, name, rt, ns, ch, s)
     wlo = w if lo_name is None else _packed(state, lo_name, rt, ns, ch, s)
-    _module().skinny(x, w, wlo, out, mt, rt, ns, ch, lo_name is not None, s)
+    _module().skinny(x, w, wlo, out, mt, rt, ns, ch, lo_name is not None, s, state["none"] if ssq is None else ssq)
     return out
 
 
@@ -360,6 +382,7 @@ def prepare(weights: Weights):
     state["router_hi_t"] = hi.t().contiguous()
     state["router_lo_t"] = lo.t().contiguous()
     state["packed"] = {}
+    state["none"] = torch.empty(0, dtype=torch.float32, device=router.device)
     _module()
     # Pack every configuration up front: packing is untimed and must not happen in a timed call.
     for (layer, _), (rt, ns, ch, s) in CONFIGS.items():
@@ -390,5 +413,6 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
         return acc
     if skinny is not None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-        return _launch(x, layer, None, skinny, out, state)
+        # The decode layer passes "ssq" for the pooler: each token's sum of squares of the output is added to it.
+        return _launch(x, layer, None, skinny, out, state, data.get("ssq"))
     return x @ state[layer][:n].T

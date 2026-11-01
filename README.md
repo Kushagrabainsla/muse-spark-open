@@ -14,7 +14,7 @@ than SGLang's on the same inputs. The kernel track closes **2026-11-04, 11:59 pm
 |---|---|---|---|---|---|---|
 | [muse_attention_decode](muse_attention_decode) | gated attention decode over a paged FP8 cache | **1.525×** | 754 / 1152 | 1.79× | 3.22× | 09b49ea4276e4306 |
 | [muse_moe_w4a16](muse_moe_w4a16) | routed experts, NVFP4 weights | **1.704×** | 688 / 1206 | 1.81× | 2.76× | 069f543bb3604714 |
-| [muse_decode_layer](muse_decode_layer) | the whole decoder layer | **1.425×** | 703 / 1072 | 1.66× | 2.42× | 66246e98c53c47a8 |
+| [muse_decode_layer](muse_decode_layer) | the whole decoder layer | **1.439×** | 703 / 1072 | 1.66× | 2.42× | 2ef27c0f07a84d2d |
 | [muse_bf16_proj](muse_bf16_proj) | dense BF16 projections (skinny GEMMs) | **1.190×** | 1096 / 1502 | 1.24× | 1.65× | fef2017d39ec4cc2 |
 | overall kernel board | the 4 problems as one decode step | | 722 / 1722 | | | |
 
@@ -75,7 +75,8 @@ Up to 32 tokens: a cluster split-K skinny GEMM (weights streamed by 16-byte load
 over DSMEM). Above that, cuBLAS (as SGLang), plus a split-K Triton GEMM for the router.
 
 ### Decode layer (`muse_decode_layer`)
-SGLang's layer with the three kernels above swapped in.
+SGLang's layer with the three kernels above swapped in. Up to 32 tokens the pre-expert RMSNorm is folded away: the
+pooler's write-out sums each token's squares and MoE gemm1 applies the norm while it stages x.
 
 ## Lessons worth keeping
 
