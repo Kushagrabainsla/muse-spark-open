@@ -224,6 +224,11 @@ that seed's routing (75% of its routes and touched experts).
   1.677× (board M22 1.704×; bs1–128 within 1.5 %, bs256 395 vs 368 µs, like the machine variance seen on unchanged
   code). Not resubmitted here; the board stays M22 (submission_m22.py = M22 exactly). See muse_decode_layer L10.
 
+### M25 — decode-layer options: device local_start, L2 x staging, early trigger, 2026-10-31
+- moe_forward takes local_start_dev (int32 tensor; the layer passes global ids, no remap kernel); gemm1 stages x with
+  __ldcg (in the layer its predecessor, the pooler, may still be running); the norm kernel triggers
+  launch_dependents at its start (the layer's unpooler then loads its weights early). Standalone check 1.680×.
+
 ## Next
 00. (M22) The remaining skeleton: split-K atomics (up to +3.5 % if free; v4 atomics lost on the H200), the norm
    kernel (4–13 µs), x staging + per-run syncs. A 9-op decode layout (vs 11) is worth ~+0.7 % at most.

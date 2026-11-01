@@ -256,6 +256,9 @@ CUDA_SRC = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 
+// Programmatic dependent launch: with the launch attribute, griddep_wait() waits for the previous kernel and its
+// memory (the decode layer's qkv projection); without it, it returns at once.
+__device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ uint32_t e4m3x2_f16x2(uint32_t v) {  // the low 2 bytes of v
   uint32_t r;
   asm("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rn.f16x2.e4m3x2 %0, lo; }" : "=r"(r) : "r"(v));
@@ -1626,15 +1629,9 @@ __global__ void __launch_bounds__(128) attnc_kernel(
   const int RPC = 16 / NCH;  // rows merged per CTA
   const __nv_bfloat16* tok = qkv + (size_t)b * QKV_W;
   const int jh = tid >> 3, d0 = (tid & 7) * 8;  // thread: dims d0 .. d0 + 7 of query head h0 G + jh
-  if (tid < RPC * 8) cp16(gs + tid * 8, tok + (HQ + 2 * HKV + h0 * G + c * RPC + jh) * D + d0, true);
-  cp_commit();
-  // Everything that does not depend on the request's length is read at once, up front: the queries, the new keys
-  // and values (warp 0; only the owner uses them), the scalars (pinned in registers: left to the compiler, the
-  // scale loads sink to their uses, a cold DRAM read each at the end of the kernel).
-  const uint4 qraw = *reinterpret_cast<const uint4*>(tok + (h0 * G + jh) * D + d0);
-  uint4 kvraw = make_uint4(0, 0, 0, 0);
-  if (warp == 0)  // lanes 0-15 the new keys, 16-31 the new values (head h0 + bit 3 of the lane)
-    kvraw = *reinterpret_cast<const uint4*>(tok + (HQ + (lane >> 4) * HKV + h0 + ((lane >> 3) & 1)) * D + d0);
+  // First what the previous kernel (the decode layer's qkv projection, when launched with programmatic
+  // serialization) does not write: the scalars (pinned in registers: left to the compiler, the scale loads sink to
+  // their uses, a cold DRAM read each at the end of the kernel) and the chunk's page-table rows.
   float pos = (float)positions[b], ksc = kscale[0], vsc = vscale[0];
   long long loc = cache_loc[b];
   int seq = seqlens[b];
@@ -1644,12 +1641,22 @@ __global__ void __launch_bounds__(128) attnc_kernel(
   const int cs = lo + c * CH, ce = min(cs + CH, hi);
   const bool empty = cs >= hi, owner = !empty && seq < ce;
   const int hh = warp & 1, ks = warp >> 1;
+  if (!empty)
+    for (int i = tid; i < ce - cs; i += NT) {
+      const int p = cs + i;
+      rows[i] = pt[(size_t)b * max_pages + p / page] * page + p % page;
+    }
+  griddep_wait();
+  // Then the qkv rows: the gates, the queries, the new keys and values (warp 0; only the owner uses them).
+  if (tid < RPC * 8) cp16(gs + tid * 8, tok + (HQ + 2 * HKV + h0 * G + c * RPC + jh) * D + d0, true);
+  cp_commit();
+  // (L2 reads: qkv comes from the kernel this one overlaps, and this SM's L1 may hold the last call's.)
+  const uint4 qraw = __ldcg(reinterpret_cast<const uint4*>(tok + (h0 * G + jh) * D + d0));
+  uint4 kvraw = make_uint4(0, 0, 0, 0);
+  if (warp == 0)  // lanes 0-15 the new keys, 16-31 the new values (head h0 + bit 3 of the lane)
+    kvraw = __ldcg(reinterpret_cast<const uint4*>(tok + (HQ + (lane >> 4) * HKV + h0 + ((lane >> 3) & 1)) * D + d0));
 
   if (!empty) {
-    for (int i = tid; i < ce - cs; i += NT) {
-      const int pos = cs + i;
-      rows[i] = pt[(size_t)b * max_pages + pos / page] * page + pos % page;
-    }
     float x[8], sn[4], cn[4];
     if (rope) rope_cs(d0, pos, theta_log2, sn, cn);
     bf16x8(qraw, x);
@@ -1863,13 +1870,15 @@ void attnc(torch::Tensor qkv, torch::Tensor positions, torch::Tensor cache_loc, 
   cfg.blockDim = dim3(128);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = 1;
   attr[0].val.clusterDim.y = NCH;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;  // starts while the qkv projection ends
+  attr[1].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = 2;
 #define LAUNCHC(SKK)                                                                                           \
   {                                                                                                           \
     auto k = attnc_kernel<STG, SKK>;                                                                           \
@@ -1966,32 +1975,43 @@ __global__ void __launch_bounds__(256, 2) attnpcc_kernel(
   const int b = bh / HKV, h = bh % HKV, HQ = HKV * G;
   const int RPC = (64 + NCH - 1) / NCH;  // rows merged per CTA: c RPC ..
   const __nv_bfloat16* tok = qkv + (size_t)b * L * QKV_W;
-  // Up front, independent of the request's length: the queries (two (row, 8-dim) slices per thread), the new keys and
-  // values (threads 0-127: k for 0-63, v for 64-127; token (t >> 3) & 7), the scalars (pinned in registers).
+  // First what the previous kernel (the decode layer's qkv projection, when launched with programmatic
+  // serialization) does not write: the scalars (pinned in registers), the first stages' page-table rows (one per
+  // thread, stored below) and the RoPE table. Then the qkv rows: the queries (two (row, 8-dim) slices per thread),
+  // the new keys and values (threads 0-127: k for 0-63, v for 64-127; token (t >> 3) & 7) and the gates.
   const int s8 = (threadIdx.x & 7) * 8;
-  uint4 qraw[2];
-#pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    const int r = (threadIdx.x >> 3) + 32 * i, j = r >> 3;
-    qraw[i] = *reinterpret_cast<const uint4*>(tok + (size_t)j * QKV_W + (h * G + (r & 7)) * D + s8);
-  }
   const int kj = (threadIdx.x >> 3) & 7, kpart = (threadIdx.x >> 6) & 1;
-  uint4 kvraw = make_uint4(0, 0, 0, 0);
-  if (threadIdx.x < 128)
-    kvraw = *reinterpret_cast<const uint4*>(tok + (size_t)kj * QKV_W + (HQ + kpart * HKV + h) * D + s8);
   float ksc = kscale[0], vsc = vscale[0], tpos = (float)positions[b * L + (threadIdx.x >> 5)];
   long long kloc = cache_loc[b * L + kj];
   int seq = seqlens[b];
   asm volatile("" : "+f"(ksc), "+f"(vsc), "+f"(tpos), "+l"(kloc), "+r"(seq));
+  const int hi = seq + L;
+  const int lo = window > 0 ? max(seq - (window - 1), 0) : 0;
+  const int cs = lo + c * CH, ce = min(cs + CH, hi);
+  const bool empty = cs >= hi, owner = !empty && ce > seq;
+  const int first = empty ? 0 : min(ce - cs, SK * (STG - 1));  // <= NT: one page-table read per thread
+  const int prow = threadIdx.x < first ? pt[(size_t)b * max_pages + (cs + threadIdx.x) / page] * page +
+                                             (cs + threadIdx.x) % page : 0;
+  if (!empty && rope) {  // thread: token threadIdx.x / 32, pair threadIdx.x % 32
+    float sn, cn;
+    sincosf(tpos * exp2f(-(2.f * (float)(threadIdx.x & 31) / 64.f) * theta_log2), &sn, &cn);
+    rt[threadIdx.x] = make_float2(sn, cn);
+  }
+  griddep_wait();
+  uint4 qraw[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r = (threadIdx.x >> 3) + 32 * i, j = r >> 3;
+    qraw[i] = __ldcg(reinterpret_cast<const uint4*>(tok + (size_t)j * QKV_W + (h * G + (r & 7)) * D + s8));
+  }
+  uint4 kvraw = make_uint4(0, 0, 0, 0);
+  if (threadIdx.x < 128)  // (L2 reads, as attnc_kernel's)
+    kvraw = __ldcg(reinterpret_cast<const uint4*>(tok + (size_t)kj * QKV_W + (HQ + kpart * HKV + h) * D + s8));
   if (threadIdx.x < RPC * 8 && c * RPC + (threadIdx.x >> 3) < 64) {
     const int j = c * RPC + (threadIdx.x >> 3);
     cp16(gs + threadIdx.x * 8, tok + (size_t)(j >> 3) * QKV_W + (HQ + 2 * HKV + h * G + (j & 7)) * D + s8, true);
   }
   cp_commit();
-  const int hi = seq + L;
-  const int lo = window > 0 ? max(seq - (window - 1), 0) : 0;
-  const int cs = lo + c * CH, ce = min(cs + CH, hi);
-  const bool empty = cs >= hi, owner = !empty && ce > seq;
 
   if (!empty) {
     const int nsteps = (ce - cs + SK - 1) / SK;
@@ -2008,15 +2028,7 @@ __global__ void __launch_bounds__(256, 2) attnpcc_kernel(
           if (i0 + j * NT < to) rows[i0 + j * NT] = v[j];
       }
     };
-    const int first = min(ce - cs, SK * (STG - 1));  // <= NT: one page-table read per thread, stored below
-    const int prow = threadIdx.x < first ? pt[(size_t)b * max_pages + (cs + threadIdx.x) / page] * page +
-                                               (cs + threadIdx.x) % page : 0;
-    if (rope) {  // thread: token threadIdx.x / 32, pair threadIdx.x % 32
-      float sn, cn;
-      sincosf(tpos * exp2f(-(2.f * (float)(threadIdx.x & 31) / 64.f) * theta_log2), &sn, &cn);
-      rt[threadIdx.x] = make_float2(sn, cn);
-    }
-    __syncthreads();
+    __syncthreads();  // the RoPE table
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int r = (threadIdx.x >> 3) + 32 * i;
@@ -2288,13 +2300,15 @@ void attnpcc(torch::Tensor qkv, torch::Tensor positions, torch::Tensor cache_loc
   cfg.blockDim = dim3(256);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = 1;
   attr[0].val.clusterDim.y = NCH;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;  // starts while the qkv projection ends
+  attr[1].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = 2;
   auto k = attnpcc_kernel<STG, SK>;
   static bool set = false;
   if (!set) {

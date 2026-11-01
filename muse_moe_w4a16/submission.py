@@ -312,7 +312,7 @@ __global__ void __launch_bounds__(NW * 32) moe_gemm(const bf16* __restrict__ x, 
                                                      float* __restrict__ acc_out,
                                                      int out_stride, int K, int tiles, int S,
                                                      const float* __restrict__ pss, const float* __restrict__ pnw,
-                                                     float peps) {
+                                                     float peps, const int* __restrict__ ls_dev) {
   constexpr int TK = 8 * MT, ROWS = NW * 16 * RT;
   constexpr int XS = KC + 32;  // row stride (bytes = 64 mod 128) keeps 16-byte reads conflict-free
   constexpr int nst = KC / 128;
@@ -324,13 +324,16 @@ __global__ void __launch_bounds__(NW * 32) moe_gemm(const bf16* __restrict__ x, 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
   // gemm1 waits for the previous kernel (the last call's norm zeroes h1). gemm2 routes and prefetches its first
   // weights, then waits for gemm1 (its x).
+  // ls_dev (the decode layer): the first local expert is in device memory (an input, read before the wait).
+  int ls = local_start;
   if constexpr (MODE == 0) {
+    if (ls_dev != nullptr) ls = __ldg(ls_dev);
     griddep_wait();
     if (blockIdx.x != 0) griddep_launch();
   }
   int* R = reinterpret_cast<int*>(smem + ring_offset(TK, XS) + (size_t)NW * STG * SUB * RT * 2 * (32 * 16 + 8 * 8));
   if constexpr (MODE == 0) {
-    route_cta<TK>(ids, M, local_start, local_count, R);
+    route_cta<TK>(ids, M, ls, local_count, R);
     // CTA 0 publishes the routing (meta, act, cnt, off, then the pairs) before it lets gemm2 launch.
     if (blockIdx.x == 0) {
       const int np = R[R_OFF + 31] + R[R_CNT + 31];
@@ -461,8 +464,10 @@ __global__ void __launch_bounds__(NW * 32) moe_gemm(const bf16* __restrict__ x, 
             uint2 lo, hi;
             if constexpr (MODE == 0) {
               const bf16* xr = x + (size_t)(p >> 3) * K + k0;
-              lo = __ldg(reinterpret_cast<const uint2*>(xr));
-              hi = __ldg(reinterpret_cast<const uint2*>(xr + 16));
+              // L2 reads: in the decode layer x comes from the kernel this one may overlap (programmatic launch),
+              // and this SM's L1 may hold the last call's.
+              lo = __ldcg(reinterpret_cast<const uint2*>(xr));
+              hi = __ldcg(reinterpret_cast<const uint2*>(xr + 16));
               if (pss != nullptr) {  // the decode layer's pre-expert RMSNorm, folded in: x * rsqrt(ss / K + eps) * nw
                 const float rs = rsqrtf(__ldcg(pss + (p >> 3)) / K + peps);
                 lo = norm4(lo, pnw + k0, rs);
@@ -582,14 +587,16 @@ constexpr int NORM_ZC = 4;
 __global__ void __launch_bounds__(512) norm_kernel(float* __restrict__ y, float* __restrict__ h1,
                                                    const int* __restrict__ ids, const float* __restrict__ tw,
                                                    const float* __restrict__ nw, int local_start, int local_count,
-                                                   float eps, bf16* __restrict__ out, float* __restrict__ pss) {
+                                                   float eps, bf16* __restrict__ out, float* __restrict__ pss,
+                                                   const int* __restrict__ ls_dev) {
   constexpr int H = 4096, I2 = 8192;
   const int t = blockIdx.x;
   const float4 zero = make_float4(0.f, 0.f, 0.f, 0.f);
+  griddep_launch();  // the next kernel (the decode layer's unpooler) may start loading its weights
   bool local[8];
 #pragma unroll
   for (int s = 0; s < 8; ++s) {
-    const int e = ids[t * 8 + s] - local_start;
+    const int e = ids[t * 8 + s] - (ls_dev != nullptr ? __ldg(ls_dev) : local_start);
     local[s] = e >= 0 && e < local_count;
   }
   // The routing, weights and norm weight are inputs: read them before waiting for gemm2.
@@ -663,7 +670,7 @@ template <int MT, int RT, int MODE, bool EXACT, int KC>
 void launch_gemm_kc(const torch::Tensor& x, const torch::Tensor& h1, const torch::Tensor& wq, const torch::Tensor& wsf,
                  const torch::Tensor& gs, const torch::Tensor& ids, int ls, int lc, const torch::Tensor& rglob, int M,
                  torch::Tensor& out, int K,
-                 int tiles, int S, const float* pss, const float* pnw, float peps) {
+                 int tiles, int S, const float* pss, const float* pnw, float peps, const int* ls_dev) {
   constexpr int TK = 8 * MT;
   auto kernel = moe_gemm<MT, RT, MODE, EXACT, KC>;
   const size_t smem = ring_offset(TK, KC + 32) + (size_t)NW * STG * SUB * RT * 2 * (32 * 16 + 8 * 8) +
@@ -703,7 +710,7 @@ void launch_gemm_kc(const torch::Tensor& x, const torch::Tensor& h1, const torch
   cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const bf16*>(x.data_ptr()), h1.data_ptr<float>(),
                      reinterpret_cast<const uint4*>(wq.data_ptr()), reinterpret_cast<const uint2*>(wsf.data_ptr()),
                      gs.data_ptr<float>(), ids.data_ptr<int>(), ls, lc, rglob.data_ptr<int>(), M, out.data_ptr<float>(), (int)out.size(1), K,
-                     tiles, S, pss, pnw, peps);
+                     tiles, S, pss, pnw, peps, ls_dev);
 }
 
 // K per split (KC) is a compile-time constant of the kernel: 512 (split 8) or 256 (split 16) of K = 4096.
@@ -711,11 +718,12 @@ template <int MT, int RT, int MODE, bool EXACT>
 void launch_gemm(const torch::Tensor& x, const torch::Tensor& h1, const torch::Tensor& wq, const torch::Tensor& wsf,
                  const torch::Tensor& gs, const torch::Tensor& ids, int ls, int lc, const torch::Tensor& rglob, int M,
                  torch::Tensor& out, int K,
-                 int tiles, int S, const float* pss = nullptr, const float* pnw = nullptr, float peps = 0.f) {
+                 int tiles, int S, const float* pss = nullptr, const float* pnw = nullptr, float peps = 0.f,
+                 const int* ls_dev = nullptr) {
   if (K / S == 512)
-    return launch_gemm_kc<MT, RT, MODE, EXACT, 512>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps);
+    return launch_gemm_kc<MT, RT, MODE, EXACT, 512>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps, ls_dev);
   if (K / S == 256)
-    return launch_gemm_kc<MT, RT, MODE, EXACT, 256>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps);
+    return launch_gemm_kc<MT, RT, MODE, EXACT, 256>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps, ls_dev);
   TORCH_CHECK(false, "moe_gemm is built for K / S = 512 or 256");
 }
 
@@ -723,20 +731,23 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Te
                  torch::Tensor w13gs, torch::Tensor w2q, torch::Tensor w2sf, torch::Tensor w2gs, torch::Tensor nw,
                  torch::Tensor rglob, torch::Tensor h1, torch::Tensor y, torch::Tensor out, int64_t mt, int64_t rt, int64_t S1, int64_t S2,
                  int64_t local_start, int64_t local_count, double eps, bool exact, torch::Tensor pre_ss,
-                 torch::Tensor pre_w, double pre_eps) {
+                 torch::Tensor pre_w, double pre_eps, torch::Tensor local_start_dev) {
   const int M = x.size(0), H = x.size(1), I = h1.size(1) / 2;
   // pre_ss / pre_w non-empty (the decode layer): x is the pooler's output, pre_ss its per-token sum of squares, and
   // gemm1 applies the pre-expert RMSNorm (weight pre_w) as it stages x; the norm kernel zeroes pre_ss.
   float* pss = pre_ss.numel() ? pre_ss.data_ptr<float>() : nullptr;
   const float* pnw = pre_w.numel() ? pre_w.data_ptr<float>() : nullptr;
   TORCH_CHECK(!pss || (pnw && pre_w.numel() == H && pre_ss.numel() >= M), "moe: pre-norm buffers");
+  // local_start_dev non-empty (the decode layer): ids are global and the first local expert is read from it.
+  TORCH_CHECK(local_start_dev.numel() == 0 || local_start_dev.scalar_type() == torch::kInt32, "moe: int32 local_start");
+  const int* lsd = local_start_dev.numel() ? local_start_dev.data_ptr<int>() : nullptr;
   auto stream = at::cuda::getCurrentCUDAStream();
   const int ls = (int)local_start, lc = (int)local_count;
   const int rows = NW * 16 * (int)rt;
 #define GEMMS_(MT_, RT_, EX_)                                                                                    \
   if (mt == MT_ && rt == RT_ && exact == EX_) {                                                                  \
     launch_gemm<MT_, RT_, 0, EX_>(x, h1, w13q, w13sf, w13gs, ids, ls, lc, rglob, M, h1, H, 2 * I / rows, S1,  \
-                                  pss, pnw, (float)pre_eps);                                                    \
+                                  pss, pnw, (float)pre_eps, lsd);                                               \
     launch_gemm<MT_, RT_, 1, EX_>(x, h1, w2q, w2sf, w2gs, ids, ls, lc, rglob, M, y, I, H / rows, S2);          \
   } else
 #define GEMMS(MT_, RT_) GEMMS_(MT_, RT_, false) GEMMS_(MT_, RT_, true)
@@ -753,7 +764,7 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Te
   cfg.numAttrs = 1;
   cudaLaunchKernelEx(&cfg, norm_kernel, y.data_ptr<float>(), h1.data_ptr<float>(), (const int*)ids.data_ptr<int>(),
                      (const float*)tw.data_ptr<float>(), (const float*)nw.data_ptr<float>(), (int)local_start,
-                     (int)local_count, (float)eps, reinterpret_cast<bf16*>(out.data_ptr()), pss);
+                     (int)local_count, (float)eps, reinterpret_cast<bf16*>(out.data_ptr()), pss, lsd);
 }
 """
 
@@ -761,7 +772,7 @@ CPP_SRC = ("void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor t
            "torch::Tensor w13sf, torch::Tensor w13gs, torch::Tensor w2q, torch::Tensor w2sf, torch::Tensor w2gs, "
            "torch::Tensor nw, torch::Tensor rglob, torch::Tensor h1, torch::Tensor y, torch::Tensor out, int64_t mt, int64_t rt, int64_t S1, int64_t S2, "
            "int64_t local_start, int64_t local_count, double eps, bool exact, torch::Tensor pre_ss, "
-           "torch::Tensor pre_w, double pre_eps);")
+           "torch::Tensor pre_w, double pre_eps, torch::Tensor local_start_dev);")
 
 _mod = None
 
@@ -853,6 +864,7 @@ def prepare(weights: Weights):
         "h1": torch.zeros((ACC_MAX_M * TOP_K, 2 * inner), dtype=torch.float32, device=dev),
         "y": torch.zeros((ACC_MAX_M * TOP_K, hidden), dtype=torch.float32, device=dev),
         "none": torch.empty(0, dtype=torch.float32, device=dev),
+        "none_i": torch.empty(0, dtype=torch.int32, device=dev),
     }
     _module()
     torch.cuda.synchronize()
@@ -876,7 +888,10 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     # The decode layer may pass ("pre_norm") the pre-expert RMSNorm to fold into gemm1: (per-token sum of squares
     # of x, a buffer the norm kernel zeroes after use; FP32 norm weight; eps).
     pre_ss, pre_w, pre_eps = data.get("pre_norm") or (state["none"], state["none"], 0.0)
+    # ... and "local_start_dev": an int32 tensor holding the first local expert, with global ids (no remap kernel).
+    ls_dev = data.get("local_start_dev")
     _module().moe_forward(x, data["topk_ids"], data["topk_weights"], w13q, w13sf, state["w13gs"], w2q, w2sf,
                           state["w2gs"], state["nw"], rglob, h1, y, out, mt, rt, s1, s2, LOCAL_START,
-                          LOCAL_COUNT, POST_NORM_EPS, state["exact"], pre_ss, pre_w, pre_eps)
+                          LOCAL_COUNT, POST_NORM_EPS, state["exact"], pre_ss, pre_w, pre_eps,
+                          state["none_i"] if ls_dev is None else ls_dev)
     return out

@@ -259,6 +259,9 @@ _attn_CUDA_SRC = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 
+// Programmatic dependent launch: with the launch attribute, griddep_wait() waits for the previous kernel and its
+// memory (the decode layer's qkv projection); without it, it returns at once.
+__device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ uint32_t e4m3x2_f16x2(uint32_t v) {  // the low 2 bytes of v
   uint32_t r;
   asm("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rn.f16x2.e4m3x2 %0, lo; }" : "=r"(r) : "r"(v));
@@ -1629,15 +1632,9 @@ __global__ void __launch_bounds__(128) attnc_kernel(
   const int RPC = 16 / NCH;  // rows merged per CTA
   const __nv_bfloat16* tok = qkv + (size_t)b * QKV_W;
   const int jh = tid >> 3, d0 = (tid & 7) * 8;  // thread: dims d0 .. d0 + 7 of query head h0 G + jh
-  if (tid < RPC * 8) cp16(gs + tid * 8, tok + (HQ + 2 * HKV + h0 * G + c * RPC + jh) * D + d0, true);
-  cp_commit();
-  // Everything that does not depend on the request's length is read at once, up front: the queries, the new keys
-  // and values (warp 0; only the owner uses them), the scalars (pinned in registers: left to the compiler, the
-  // scale loads sink to their uses, a cold DRAM read each at the end of the kernel).
-  const uint4 qraw = *reinterpret_cast<const uint4*>(tok + (h0 * G + jh) * D + d0);
-  uint4 kvraw = make_uint4(0, 0, 0, 0);
-  if (warp == 0)  // lanes 0-15 the new keys, 16-31 the new values (head h0 + bit 3 of the lane)
-    kvraw = *reinterpret_cast<const uint4*>(tok + (HQ + (lane >> 4) * HKV + h0 + ((lane >> 3) & 1)) * D + d0);
+  // First what the previous kernel (the decode layer's qkv projection, when launched with programmatic
+  // serialization) does not write: the scalars (pinned in registers: left to the compiler, the scale loads sink to
+  // their uses, a cold DRAM read each at the end of the kernel) and the chunk's page-table rows.
   float pos = (float)positions[b], ksc = kscale[0], vsc = vscale[0];
   long long loc = cache_loc[b];
   int seq = seqlens[b];
@@ -1647,12 +1644,22 @@ __global__ void __launch_bounds__(128) attnc_kernel(
   const int cs = lo + c * CH, ce = min(cs + CH, hi);
   const bool empty = cs >= hi, owner = !empty && seq < ce;
   const int hh = warp & 1, ks = warp >> 1;
+  if (!empty)
+    for (int i = tid; i < ce - cs; i += NT) {
+      const int p = cs + i;
+      rows[i] = pt[(size_t)b * max_pages + p / page] * page + p % page;
+    }
+  griddep_wait();
+  // Then the qkv rows: the gates, the queries, the new keys and values (warp 0; only the owner uses them).
+  if (tid < RPC * 8) cp16(gs + tid * 8, tok + (HQ + 2 * HKV + h0 * G + c * RPC + jh) * D + d0, true);
+  cp_commit();
+  // (L2 reads: qkv comes from the kernel this one overlaps, and this SM's L1 may hold the last call's.)
+  const uint4 qraw = __ldcg(reinterpret_cast<const uint4*>(tok + (h0 * G + jh) * D + d0));
+  uint4 kvraw = make_uint4(0, 0, 0, 0);
+  if (warp == 0)  // lanes 0-15 the new keys, 16-31 the new values (head h0 + bit 3 of the lane)
+    kvraw = __ldcg(reinterpret_cast<const uint4*>(tok + (HQ + (lane >> 4) * HKV + h0 + ((lane >> 3) & 1)) * D + d0));
 
   if (!empty) {
-    for (int i = tid; i < ce - cs; i += NT) {
-      const int pos = cs + i;
-      rows[i] = pt[(size_t)b * max_pages + pos / page] * page + pos % page;
-    }
     float x[8], sn[4], cn[4];
     if (rope) rope_cs(d0, pos, theta_log2, sn, cn);
     bf16x8(qraw, x);
@@ -1866,13 +1873,15 @@ void attnc(torch::Tensor qkv, torch::Tensor positions, torch::Tensor cache_loc, 
   cfg.blockDim = dim3(128);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = 1;
   attr[0].val.clusterDim.y = NCH;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;  // starts while the qkv projection ends
+  attr[1].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = 2;
 #define LAUNCHC(SKK)                                                                                           \
   {                                                                                                           \
     auto k = attnc_kernel<STG, SKK>;                                                                           \
@@ -1969,32 +1978,43 @@ __global__ void __launch_bounds__(256, 2) attnpcc_kernel(
   const int b = bh / HKV, h = bh % HKV, HQ = HKV * G;
   const int RPC = (64 + NCH - 1) / NCH;  // rows merged per CTA: c RPC ..
   const __nv_bfloat16* tok = qkv + (size_t)b * L * QKV_W;
-  // Up front, independent of the request's length: the queries (two (row, 8-dim) slices per thread), the new keys and
-  // values (threads 0-127: k for 0-63, v for 64-127; token (t >> 3) & 7), the scalars (pinned in registers).
+  // First what the previous kernel (the decode layer's qkv projection, when launched with programmatic
+  // serialization) does not write: the scalars (pinned in registers), the first stages' page-table rows (one per
+  // thread, stored below) and the RoPE table. Then the qkv rows: the queries (two (row, 8-dim) slices per thread),
+  // the new keys and values (threads 0-127: k for 0-63, v for 64-127; token (t >> 3) & 7) and the gates.
   const int s8 = (threadIdx.x & 7) * 8;
-  uint4 qraw[2];
-#pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    const int r = (threadIdx.x >> 3) + 32 * i, j = r >> 3;
-    qraw[i] = *reinterpret_cast<const uint4*>(tok + (size_t)j * QKV_W + (h * G + (r & 7)) * D + s8);
-  }
   const int kj = (threadIdx.x >> 3) & 7, kpart = (threadIdx.x >> 6) & 1;
-  uint4 kvraw = make_uint4(0, 0, 0, 0);
-  if (threadIdx.x < 128)
-    kvraw = *reinterpret_cast<const uint4*>(tok + (size_t)kj * QKV_W + (HQ + kpart * HKV + h) * D + s8);
   float ksc = kscale[0], vsc = vscale[0], tpos = (float)positions[b * L + (threadIdx.x >> 5)];
   long long kloc = cache_loc[b * L + kj];
   int seq = seqlens[b];
   asm volatile("" : "+f"(ksc), "+f"(vsc), "+f"(tpos), "+l"(kloc), "+r"(seq));
+  const int hi = seq + L;
+  const int lo = window > 0 ? max(seq - (window - 1), 0) : 0;
+  const int cs = lo + c * CH, ce = min(cs + CH, hi);
+  const bool empty = cs >= hi, owner = !empty && ce > seq;
+  const int first = empty ? 0 : min(ce - cs, SK * (STG - 1));  // <= NT: one page-table read per thread
+  const int prow = threadIdx.x < first ? pt[(size_t)b * max_pages + (cs + threadIdx.x) / page] * page +
+                                             (cs + threadIdx.x) % page : 0;
+  if (!empty && rope) {  // thread: token threadIdx.x / 32, pair threadIdx.x % 32
+    float sn, cn;
+    sincosf(tpos * exp2f(-(2.f * (float)(threadIdx.x & 31) / 64.f) * theta_log2), &sn, &cn);
+    rt[threadIdx.x] = make_float2(sn, cn);
+  }
+  griddep_wait();
+  uint4 qraw[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r = (threadIdx.x >> 3) + 32 * i, j = r >> 3;
+    qraw[i] = __ldcg(reinterpret_cast<const uint4*>(tok + (size_t)j * QKV_W + (h * G + (r & 7)) * D + s8));
+  }
+  uint4 kvraw = make_uint4(0, 0, 0, 0);
+  if (threadIdx.x < 128)  // (L2 reads, as attnc_kernel's)
+    kvraw = __ldcg(reinterpret_cast<const uint4*>(tok + (size_t)kj * QKV_W + (HQ + kpart * HKV + h) * D + s8));
   if (threadIdx.x < RPC * 8 && c * RPC + (threadIdx.x >> 3) < 64) {
     const int j = c * RPC + (threadIdx.x >> 3);
     cp16(gs + threadIdx.x * 8, tok + (size_t)(j >> 3) * QKV_W + (HQ + 2 * HKV + h * G + (j & 7)) * D + s8, true);
   }
   cp_commit();
-  const int hi = seq + L;
-  const int lo = window > 0 ? max(seq - (window - 1), 0) : 0;
-  const int cs = lo + c * CH, ce = min(cs + CH, hi);
-  const bool empty = cs >= hi, owner = !empty && ce > seq;
 
   if (!empty) {
     const int nsteps = (ce - cs + SK - 1) / SK;
@@ -2011,15 +2031,7 @@ __global__ void __launch_bounds__(256, 2) attnpcc_kernel(
           if (i0 + j * NT < to) rows[i0 + j * NT] = v[j];
       }
     };
-    const int first = min(ce - cs, SK * (STG - 1));  // <= NT: one page-table read per thread, stored below
-    const int prow = threadIdx.x < first ? pt[(size_t)b * max_pages + (cs + threadIdx.x) / page] * page +
-                                               (cs + threadIdx.x) % page : 0;
-    if (rope) {  // thread: token threadIdx.x / 32, pair threadIdx.x % 32
-      float sn, cn;
-      sincosf(tpos * exp2f(-(2.f * (float)(threadIdx.x & 31) / 64.f) * theta_log2), &sn, &cn);
-      rt[threadIdx.x] = make_float2(sn, cn);
-    }
-    __syncthreads();
+    __syncthreads();  // the RoPE table
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int r = (threadIdx.x >> 3) + 32 * i;
@@ -2291,13 +2303,15 @@ void attnpcc(torch::Tensor qkv, torch::Tensor positions, torch::Tensor cache_loc
   cfg.blockDim = dim3(256);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = 1;
   attr[0].val.clusterDim.y = NCH;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;  // starts while the qkv projection ends
+  attr[1].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = 2;
   auto k = attnpcc_kernel<STG, SK>;
   static bool set = false;
   if (!set) {
@@ -2596,6 +2610,11 @@ __device__ __forceinline__ uint4 ld_stream(const void* p) {
   return r;
 }
 
+// Programmatic dependent launch (the decode layer chains our kernels): griddep_wait() waits for the previous kernel
+// and its memory; griddep_launch() lets the next one start. Both are no-ops without the launch attribute.
+__device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void griddep_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+
 // Writes one output (FP32, or rounded to BF16). With ssq (the decode layer's pooler), also adds each token's sum of
 // squares of its rounded outputs to ssq[token]: the BN lanes holding one token's outputs (aligned, one warp) sum
 // theirs by shuffles and the first adds them, so the next kernel can apply an RMSNorm without another pass.
@@ -2623,7 +2642,7 @@ template <int MT, int RT, int NSTEPS, int CH, bool LO, bool OUT_F32>
 __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __restrict__ x,
                                                      const __nv_bfloat16* __restrict__ w,
                                                      const __nv_bfloat16* __restrict__ wlo,
-                                                     void* __restrict__ out, int M, int N, int K, int S,
+                                                     void* __restrict__ out, int M, int ldo, int K, int S,
                                                      float* __restrict__ ssq) {
   constexpr int BN = 16 * RT, TK = 8 * MT, ELEMS = BN * TK;
   static_assert(BN == 16 || BN == 32, "a token's BN outputs are BN consecutive lanes of one warp");
@@ -2641,6 +2660,11 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
   // W is packed so that each warp's loads are contiguous: [tile][rank][warp][chunk][s][rt][h][lane][8].
   const size_t wwarp = ((size_t)(blockIdx.x / S) * S + rank) * 4 + warp;
 
+  // Launched with programmatic serialization: the next kernel may start now (it waits for this one before reading
+  // our output), and with one chunk this one issues its weight loads before waiting for the previous kernel (only x
+  // depends on it). With several chunks it waits first: a wait inside the chunk loop measured 15-25 % slower there.
+  griddep_launch();
+  if constexpr (CH > 1) griddep_wait();
   float acc[RT][MT][4];
 #pragma unroll
   for (int rt = 0; rt < RT; ++rt)
@@ -2667,13 +2691,15 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
           if constexpr (LO) lv[s][rt][h] = ld_stream(wlo + off);
         }
 
+    if constexpr (CH == 1) griddep_wait();
     uint4 xv[NSTEPS][MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
       const int tok = mt * 8 + g;
 #pragma unroll
       for (int s = 0; s < NSTEPS; ++s)
-        xv[s][mt] = tok < M ? __ldg(reinterpret_cast<const uint4*>(x + (size_t)tok * K + kw + 32 * s))
+        // L2 reads: x may come from the kernel this one overlaps, and this SM's L1 may hold the last call's.
+        xv[s][mt] = tok < M ? __ldcg(reinterpret_cast<const uint4*>(x + (size_t)tok * K + kw + 32 * s))
                             : make_uint4(0, 0, 0, 0);
     }
 
@@ -2721,7 +2747,7 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
       float sum = 0.f;
       if (ok)
         for (int r = 0; r < S; ++r) sum += rcv[r * EPO + li];
-      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * N + n0 + row, sum);
+      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * ldo + n0 + row, sum);
     }
   } else {
     for (int i = threadIdx.x; i < ELEMS; i += 128) rcv[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
@@ -2733,7 +2759,7 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
       float sum = 0.f;
       if (ok)
         for (int r = 0; r < S; ++r) sum += cluster.map_shared_rank(rcv, r)[i];
-      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * N + n0 + row, sum);
+      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * ldo + n0 + row, sum);
     }
     cluster.sync();  // keep this CTA's shared memory alive until the others have read it
   }
@@ -2742,7 +2768,7 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
 template <int MT, int RT, int NSTEPS, int CH, bool LO>
 void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& wlo, torch::Tensor& out, int S,
             float* ssq) {
-  const int M = x.size(0), K = x.size(1), N = out.size(1);
+  const int M = x.size(0), K = x.size(1), N = out.size(1), ldo = out.stride(0);
   auto kernel = skinny_kernel<MT, RT, NSTEPS, CH, LO, LO>;
   static bool attr_set = false;
   if (!attr_set) {
@@ -2753,22 +2779,25 @@ void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor&
   cfg.gridDim = dim3((N / (16 * RT)) * S);
   cfg.blockDim = dim3(128);
   cfg.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = S;
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[1].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = 2;
   cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
                      reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
-                     reinterpret_cast<const __nv_bfloat16*>(wlo.data_ptr()), out.data_ptr(), M, N, K, S, ssq);
+                     reinterpret_cast<const __nv_bfloat16*>(wlo.data_ptr()), out.data_ptr(), M, ldo, K, S, ssq);
 }
 
 void skinny(torch::Tensor x, torch::Tensor w, torch::Tensor wlo, torch::Tensor out, int64_t mt, int64_t rt,
             int64_t ns, int64_t ch, bool lo, int64_t s, torch::Tensor ssq) {
   float* sq = ssq.numel() ? ssq.data_ptr<float>() : nullptr;
   TORCH_CHECK(!sq || (!lo && ssq.numel() >= x.size(0)), "skinny: sum of squares only for BF16 outputs");
+  TORCH_CHECK(out.stride(1) == 1, "skinny: output rows must be contiguous");
 #define CASE(MT, RT, NS, CH, LO) \
   if (mt == MT && rt == RT && ns == NS && ch == CH && lo == LO) return launch<MT, RT, NS, CH, LO>(x, w, wlo, out, s, sq);
   CASES
@@ -2878,7 +2907,10 @@ def _proj_kernel_fn(data: Inputs, state) -> torch.Tensor:
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
     if skinny is not None:
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        # The decode layer may pass "out": a view of its own buffer (rows of a wider, zero-padded output).
+        out = data.get("out")
+        if out is None:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
         # The decode layer passes "ssq" for the pooler: each token's sum of squares of the output is added to it.
         return _proj_launch(x, layer, None, skinny, out, state, data.get("ssq"))
     return x @ state[layer][:n].T
@@ -3145,7 +3177,7 @@ __global__ void __launch_bounds__(_moe_NW * 32) moe_gemm(const bf16* __restrict_
                                                      float* __restrict__ acc_out,
                                                      int out_stride, int K, int tiles, int S,
                                                      const float* __restrict__ pss, const float* __restrict__ pnw,
-                                                     float peps) {
+                                                     float peps, const int* __restrict__ ls_dev) {
   constexpr int TK = 8 * MT, ROWS = _moe_NW * 16 * _moe_RT;
   constexpr int XS = KC + 32;  // row stride (bytes = 64 mod 128) keeps 16-byte reads conflict-free
   constexpr int nst = KC / 128;
@@ -3157,13 +3189,16 @@ __global__ void __launch_bounds__(_moe_NW * 32) moe_gemm(const bf16* __restrict_
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
   // gemm1 waits for the previous kernel (the last call's norm zeroes h1). gemm2 routes and prefetches its first
   // weights, then waits for gemm1 (its x).
+  // ls_dev (the decode layer): the first local expert is in device memory (an input, read before the wait).
+  int ls = local_start;
   if constexpr (MODE == 0) {
+    if (ls_dev != nullptr) ls = __ldg(ls_dev);
     griddep_wait();
     if (blockIdx.x != 0) griddep_launch();
   }
   int* R = reinterpret_cast<int*>(smem + ring_offset(TK, XS) + (size_t)_moe_NW * STG * SUB * _moe_RT * 2 * (32 * 16 + 8 * 8));
   if constexpr (MODE == 0) {
-    route_cta<TK>(ids, M, local_start, local_count, R);
+    route_cta<TK>(ids, M, ls, local_count, R);
     // CTA 0 publishes the routing (meta, act, cnt, off, then the pairs) before it lets gemm2 launch.
     if (blockIdx.x == 0) {
       const int np = R[R_OFF + 31] + R[R_CNT + 31];
@@ -3294,8 +3329,10 @@ __global__ void __launch_bounds__(_moe_NW * 32) moe_gemm(const bf16* __restrict_
             uint2 lo, hi;
             if constexpr (MODE == 0) {
               const bf16* xr = x + (size_t)(p >> 3) * K + k0;
-              lo = __ldg(reinterpret_cast<const uint2*>(xr));
-              hi = __ldg(reinterpret_cast<const uint2*>(xr + 16));
+              // L2 reads: in the decode layer x comes from the kernel this one may overlap (programmatic launch),
+              // and this SM's L1 may hold the last call's.
+              lo = __ldcg(reinterpret_cast<const uint2*>(xr));
+              hi = __ldcg(reinterpret_cast<const uint2*>(xr + 16));
               if (pss != nullptr) {  // the decode layer's pre-expert RMSNorm, folded in: x * rsqrt(ss / K + eps) * nw
                 const float rs = rsqrtf(__ldcg(pss + (p >> 3)) / K + peps);
                 lo = norm4(lo, pnw + k0, rs);
@@ -3415,14 +3452,16 @@ constexpr int NORM_ZC = 4;
 __global__ void __launch_bounds__(512) norm_kernel(float* __restrict__ y, float* __restrict__ h1,
                                                    const int* __restrict__ ids, const float* __restrict__ tw,
                                                    const float* __restrict__ nw, int local_start, int local_count,
-                                                   float eps, bf16* __restrict__ out, float* __restrict__ pss) {
+                                                   float eps, bf16* __restrict__ out, float* __restrict__ pss,
+                                                   const int* __restrict__ ls_dev) {
   constexpr int H = 4096, I2 = 8192;
   const int t = blockIdx.x;
   const float4 zero = make_float4(0.f, 0.f, 0.f, 0.f);
+  griddep_launch();  // the next kernel (the decode layer's unpooler) may start loading its weights
   bool local[8];
 #pragma unroll
   for (int s = 0; s < 8; ++s) {
-    const int e = ids[t * 8 + s] - local_start;
+    const int e = ids[t * 8 + s] - (ls_dev != nullptr ? __ldg(ls_dev) : local_start);
     local[s] = e >= 0 && e < local_count;
   }
   // The routing, weights and norm weight are inputs: read them before waiting for gemm2.
@@ -3496,7 +3535,7 @@ template <int MT, int _moe_RT, int MODE, bool EXACT, int KC>
 void launch_gemm_kc(const torch::Tensor& x, const torch::Tensor& h1, const torch::Tensor& wq, const torch::Tensor& wsf,
                  const torch::Tensor& gs, const torch::Tensor& ids, int ls, int lc, const torch::Tensor& rglob, int M,
                  torch::Tensor& out, int K,
-                 int tiles, int S, const float* pss, const float* pnw, float peps) {
+                 int tiles, int S, const float* pss, const float* pnw, float peps, const int* ls_dev) {
   constexpr int TK = 8 * MT;
   auto kernel = moe_gemm<MT, _moe_RT, MODE, EXACT, KC>;
   const size_t smem = ring_offset(TK, KC + 32) + (size_t)_moe_NW * STG * SUB * _moe_RT * 2 * (32 * 16 + 8 * 8) +
@@ -3536,7 +3575,7 @@ void launch_gemm_kc(const torch::Tensor& x, const torch::Tensor& h1, const torch
   cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const bf16*>(x.data_ptr()), h1.data_ptr<float>(),
                      reinterpret_cast<const uint4*>(wq.data_ptr()), reinterpret_cast<const uint2*>(wsf.data_ptr()),
                      gs.data_ptr<float>(), ids.data_ptr<int>(), ls, lc, rglob.data_ptr<int>(), M, out.data_ptr<float>(), (int)out.size(1), K,
-                     tiles, S, pss, pnw, peps);
+                     tiles, S, pss, pnw, peps, ls_dev);
 }
 
 // K per split (KC) is a compile-time constant of the kernel: 512 (split 8) or 256 (split 16) of K = 4096.
@@ -3544,11 +3583,12 @@ template <int MT, int _moe_RT, int MODE, bool EXACT>
 void launch_gemm(const torch::Tensor& x, const torch::Tensor& h1, const torch::Tensor& wq, const torch::Tensor& wsf,
                  const torch::Tensor& gs, const torch::Tensor& ids, int ls, int lc, const torch::Tensor& rglob, int M,
                  torch::Tensor& out, int K,
-                 int tiles, int S, const float* pss = nullptr, const float* pnw = nullptr, float peps = 0.f) {
+                 int tiles, int S, const float* pss = nullptr, const float* pnw = nullptr, float peps = 0.f,
+                 const int* ls_dev = nullptr) {
   if (K / S == 512)
-    return launch_gemm_kc<MT, _moe_RT, MODE, EXACT, 512>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps);
+    return launch_gemm_kc<MT, _moe_RT, MODE, EXACT, 512>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps, ls_dev);
   if (K / S == 256)
-    return launch_gemm_kc<MT, _moe_RT, MODE, EXACT, 256>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps);
+    return launch_gemm_kc<MT, _moe_RT, MODE, EXACT, 256>(x, h1, wq, wsf, gs, ids, ls, lc, rglob, M, out, K, tiles, S, pss, pnw, peps, ls_dev);
   TORCH_CHECK(false, "moe_gemm is built for K / S = 512 or 256");
 }
 
@@ -3556,20 +3596,23 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Te
                  torch::Tensor w13gs, torch::Tensor w2q, torch::Tensor w2sf, torch::Tensor w2gs, torch::Tensor nw,
                  torch::Tensor rglob, torch::Tensor h1, torch::Tensor y, torch::Tensor out, int64_t mt, int64_t rt, int64_t S1, int64_t S2,
                  int64_t local_start, int64_t local_count, double eps, bool exact, torch::Tensor pre_ss,
-                 torch::Tensor pre_w, double pre_eps) {
+                 torch::Tensor pre_w, double pre_eps, torch::Tensor local_start_dev) {
   const int M = x.size(0), H = x.size(1), I = h1.size(1) / 2;
   // pre_ss / pre_w non-empty (the decode layer): x is the pooler's output, pre_ss its per-token sum of squares, and
   // gemm1 applies the pre-expert RMSNorm (weight pre_w) as it stages x; the norm kernel zeroes pre_ss.
   float* pss = pre_ss.numel() ? pre_ss.data_ptr<float>() : nullptr;
   const float* pnw = pre_w.numel() ? pre_w.data_ptr<float>() : nullptr;
   TORCH_CHECK(!pss || (pnw && pre_w.numel() == H && pre_ss.numel() >= M), "moe: pre-norm buffers");
+  // local_start_dev non-empty (the decode layer): ids are global and the first local expert is read from it.
+  TORCH_CHECK(local_start_dev.numel() == 0 || local_start_dev.scalar_type() == torch::kInt32, "moe: int32 local_start");
+  const int* lsd = local_start_dev.numel() ? local_start_dev.data_ptr<int>() : nullptr;
   auto stream = at::cuda::getCurrentCUDAStream();
   const int ls = (int)local_start, lc = (int)local_count;
   const int rows = _moe_NW * 16 * (int)rt;
 #define GEMMS_(MT_, RT_, EX_)                                                                                    \
   if (mt == MT_ && rt == RT_ && exact == EX_) {                                                                  \
     launch_gemm<MT_, RT_, 0, EX_>(x, h1, w13q, w13sf, w13gs, ids, ls, lc, rglob, M, h1, H, 2 * I / rows, S1,  \
-                                  pss, pnw, (float)pre_eps);                                                    \
+                                  pss, pnw, (float)pre_eps, lsd);                                               \
     launch_gemm<MT_, RT_, 1, EX_>(x, h1, w2q, w2sf, w2gs, ids, ls, lc, rglob, M, y, I, H / rows, S2);          \
   } else
 #define GEMMS(MT_, RT_) GEMMS_(MT_, RT_, false) GEMMS_(MT_, RT_, true)
@@ -3586,7 +3629,7 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor tw, torch::Te
   cfg.numAttrs = 1;
   cudaLaunchKernelEx(&cfg, norm_kernel, y.data_ptr<float>(), h1.data_ptr<float>(), (const int*)ids.data_ptr<int>(),
                      (const float*)tw.data_ptr<float>(), (const float*)nw.data_ptr<float>(), (int)local_start,
-                     (int)local_count, (float)eps, reinterpret_cast<bf16*>(out.data_ptr()), pss);
+                     (int)local_count, (float)eps, reinterpret_cast<bf16*>(out.data_ptr()), pss, lsd);
 }
 """
 
@@ -3594,7 +3637,7 @@ _moe_CPP_SRC = ("void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Ten
            "torch::Tensor w13sf, torch::Tensor w13gs, torch::Tensor w2q, torch::Tensor w2sf, torch::Tensor w2gs, "
            "torch::Tensor nw, torch::Tensor rglob, torch::Tensor h1, torch::Tensor y, torch::Tensor out, int64_t mt, int64_t rt, int64_t S1, int64_t S2, "
            "int64_t local_start, int64_t local_count, double eps, bool exact, torch::Tensor pre_ss, "
-           "torch::Tensor pre_w, double pre_eps);")
+           "torch::Tensor pre_w, double pre_eps, torch::Tensor local_start_dev);")
 
 _moe_mod = None
 
@@ -3686,6 +3729,7 @@ def _moe_prepare(weights: Weights):
         "h1": torch.zeros((_moe_ACC_MAX_M * _moe_TOP_K, 2 * inner), dtype=torch.float32, device=dev),
         "y": torch.zeros((_moe_ACC_MAX_M * _moe_TOP_K, hidden), dtype=torch.float32, device=dev),
         "none": torch.empty(0, dtype=torch.float32, device=dev),
+        "none_i": torch.empty(0, dtype=torch.int32, device=dev),
     }
     _moe_module()
     torch.cuda.synchronize()
@@ -3709,9 +3753,12 @@ def _moe_kernel_fn(data: Inputs, state) -> torch.Tensor:
     # The decode layer may pass ("pre_norm") the pre-expert RMSNorm to fold into gemm1: (per-token sum of squares
     # of x, a buffer the norm kernel zeroes after use; FP32 norm weight; eps).
     pre_ss, pre_w, pre_eps = data.get("pre_norm") or (state["none"], state["none"], 0.0)
+    # ... and "local_start_dev": an int32 tensor holding the first local expert, with global ids (no remap kernel).
+    ls_dev = data.get("local_start_dev")
     _moe_module().moe_forward(x, data["topk_ids"], data["topk_weights"], w13q, w13sf, state["w13gs"], w2q, w2sf,
                           state["w2gs"], state["nw"], rglob, h1, y, out, mt, rt, s1, s2, LOCAL_START,
-                          LOCAL_COUNT, _moe_POST_NORM_EPS, state["exact"], pre_ss, pre_w, pre_eps)
+                          LOCAL_COUNT, _moe_POST_NORM_EPS, state["exact"], pre_ss, pre_w, pre_eps,
+                          state["none_i"] if ls_dev is None else ls_dev)
     return out
 
 # ---- the layer (SGLang's, with the above swapped in) ----
@@ -3887,6 +3934,9 @@ def prepare(weights):
     # (zero between calls: the MoE's norm kernel re-zeroes them) and the FP32 (1 + w).
     state["pre_ss"] = torch.zeros(256, dtype=torch.float32, device=device)
     state["pre_w"] = (1.0 + weights["pre_expert_norm"].float()).contiguous()
+    # Up to SLICED_UNPOOL_MAX_TOKENS the unpooler writes its slice into these rows; the rest stays zero (the
+    # all-gather's other GPUs' columns), so no pad kernel runs.
+    state["unpool_pad"] = torch.zeros((SLICED_UNPOOL_MAX_TOKENS, HIDDEN), dtype=torch.bfloat16, device=device)
     torch.cuda.synchronize()
     return state
 
@@ -3964,19 +4014,22 @@ def kernel_fn(data, state):
     if not torch.cuda.is_current_stream_capturing():
         for tensor in (topk_weights, topk_ids):
             tensor.record_stream(main_stream)
-    # This GPU's experts start at local_start: as SGLang's expert_map on that EP rank.
-    local_ids = (topk_ids - data["local_start"]) % N_EXPERTS
+    # This GPU's experts start at local_start (as SGLang's expert_map on that EP rank): the MoE kernels read it
+    # and take the global ids (no remap kernel).
     # all-reduce: identity
     expert_output = _moe_kernel_fn({
         "hidden_states": expert_input if fold_norm else state["pre_expert_norm"](expert_input).contiguous(),
         "pre_norm": (state["pre_ss"], state["pre_w"], RMS_EPS) if fold_norm else None,
-        "topk_ids": local_ids.to(torch.int32).contiguous(),
+        "topk_ids": topk_ids.to(torch.int32).contiguous(),
+        "local_start_dev": data["local_start"].to(torch.int32),
         "topk_weights": topk_weights.to(torch.float32).contiguous(),
         "config": {"bs": tokens, "d_hidden": D_EXPERT, "d_expert": D_EXPERT, "n_experts": N_EXPERTS,
                    "local_start": 0, "local_count": LOCAL_EXPERTS, "top_k": TOP_K, "sharding": "ep8"}}, state["moe"])
     if tokens <= SLICED_UNPOOL_MAX_TOKENS:
-        unpooled = _proj_kernel_fn({"x": expert_output, "config": {"m": expert_output.shape[0], "n": UNPOOL_SLICE, "k": expert_output.shape[1], "layer": "unpooler"}}, state["proj"])
-        ffn_output = F.pad(unpooled, (0, HIDDEN - UNPOOL_SLICE))  # all-gather: identity
+        ffn_output = state["unpool_pad"][:tokens]  # all-gather: identity (the other columns stay zero)
+        _proj_kernel_fn({"x": expert_output, "config": {"m": expert_output.shape[0], "n": UNPOOL_SLICE,
+                         "k": expert_output.shape[1], "layer": "unpooler"}, "out": ffn_output[:, :UNPOOL_SLICE]},
+                        state["proj"])
     else:
         ffn_output = _proj_kernel_fn({"x": expert_output, "config": {"m": expert_output.shape[0], "n": dense["unpooler"].shape[0], "k": expert_output.shape[1], "layer": "unpooler"}}, state["proj"])
 

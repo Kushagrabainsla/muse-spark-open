@@ -140,6 +140,13 @@ Pure-read best configs use ~2000 short CTAs. The pure-read time is the practical
 - skinny(..., ssq): with a buffer, each BF16 output's square is added to ssq[token] (BN-lane shuffle, one atomic
   per token per tile). Off in this problem: check 1.1866× (E14 1.179–1.187×). Not resubmitted.
 
+### E16 — programmatic launch and an output stride (for the decode layer), 2026-10-31
+- The skinny kernel triggers launch_dependents at its start; with CH == 1 it issues its weight loads before
+  griddepcontrol.wait (a wait inside the chunk loop made CH > 1 configs 15-25 % slower: pooler m = 16 19.9 -> 25.0 µs;
+  with CH > 1 it now waits first); x is read with __ldcg. Output row stride (ldo) so the layer's unpooler can write
+  into a zero-padded buffer. Standalone check 1.1763× (E14 1.179-1.190×, noise). An L2 prefetch kernel was tried for
+  the layer and removed (see muse_decode_layer L11).
+
 ## Next
 - The small-m loads (4 of 6) are where the geomean moves: the tail (~1–1.6 µs per small weight) and `o` (cuBLAS
   6.8 µs vs 5.5 plain read). Ideas not yet tried: a cheaper cluster tail (one cluster.sync + barrier.cluster.arrive

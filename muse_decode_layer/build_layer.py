@@ -82,6 +82,9 @@ rest = rest.replace('''    del freqs
     # (zero between calls: the MoE's norm kernel re-zeroes them) and the FP32 (1 + w).
     state["pre_ss"] = torch.zeros(256, dtype=torch.float32, device=device)
     state["pre_w"] = (1.0 + weights["pre_expert_norm"].float()).contiguous()
+    # Up to SLICED_UNPOOL_MAX_TOKENS the unpooler writes its slice into these rows; the rest stays zero (the
+    # all-gather's other GPUs' columns), so no pad kernel runs.
+    state["unpool_pad"] = torch.zeros((SLICED_UNPOOL_MAX_TOKENS, HIDDEN), dtype=torch.bfloat16, device=device)
     torch.cuda.synchronize()
     return state''')
 assert "_proj_prepare" in rest
@@ -95,6 +98,10 @@ def proj_call(x, name, n, state_expr):
 
 
 repl = [
+    ('''    # This GPU's experts start at local_start: as SGLang's expert_map on that EP rank.
+    local_ids = (topk_ids - data["local_start"]) % N_EXPERTS''',
+     '''    # This GPU's experts start at local_start (as SGLang's expert_map on that EP rank): the MoE kernels read it
+    # and take the global ids (no remap kernel).'''),
     ('    qkv = _gemm(data["attn_input"], dense["qkv_gate"])',
      '    qkv = ' + proj_call('data["attn_input"]', "qkv_gate", 'dense["qkv_gate"].shape[0]', 'state["proj"]')),
     ('''    if cfg["rope_theta"]:
@@ -157,12 +164,17 @@ repl = [
      '''    expert_output = _moe_kernel_fn({
         "hidden_states": expert_input if fold_norm else state["pre_expert_norm"](expert_input).contiguous(),
         "pre_norm": (state["pre_ss"], state["pre_w"], RMS_EPS) if fold_norm else None,
-        "topk_ids": local_ids.to(torch.int32).contiguous(),
+        "topk_ids": topk_ids.to(torch.int32).contiguous(),
+        "local_start_dev": data["local_start"].to(torch.int32),
         "topk_weights": topk_weights.to(torch.float32).contiguous(),
         "config": {"bs": tokens, "d_hidden": D_EXPERT, "d_expert": D_EXPERT, "n_experts": N_EXPERTS,
                    "local_start": 0, "local_count": LOCAL_EXPERTS, "top_k": TOP_K, "sharding": "ep8"}}, state["moe"])'''),
-    ('''        unpooled = _gemm(expert_output, dense["unpooler"][:UNPOOL_SLICE])''',
-     '''        unpooled = ''' + proj_call("expert_output", "unpooler", "UNPOOL_SLICE", 'state["proj"]')),
+    ('''        unpooled = _gemm(expert_output, dense["unpooler"][:UNPOOL_SLICE])
+        ffn_output = F.pad(unpooled, (0, HIDDEN - UNPOOL_SLICE))  # all-gather: identity''',
+     '''        ffn_output = state["unpool_pad"][:tokens]  # all-gather: identity (the other columns stay zero)
+        _proj_kernel_fn({"x": expert_output, "config": {"m": expert_output.shape[0], "n": UNPOOL_SLICE,
+                         "k": expert_output.shape[1], "layer": "unpooler"}, "out": ffn_output[:, :UNPOOL_SLICE]},
+                        state["proj"])'''),
     ('''        ffn_output = _gemm(expert_output, dense["unpooler"])''',
      '''        ffn_output = ''' + proj_call("expert_output", "unpooler", 'dense["unpooler"].shape[0]', 'state["proj"]')),
 ]

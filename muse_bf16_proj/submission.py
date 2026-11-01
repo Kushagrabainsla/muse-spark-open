@@ -130,6 +130,11 @@ __device__ __forceinline__ uint4 ld_stream(const void* p) {
   return r;
 }
 
+// Programmatic dependent launch (the decode layer chains our kernels): griddep_wait() waits for the previous kernel
+// and its memory; griddep_launch() lets the next one start. Both are no-ops without the launch attribute.
+__device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void griddep_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+
 // Writes one output (FP32, or rounded to BF16). With ssq (the decode layer's pooler), also adds each token's sum of
 // squares of its rounded outputs to ssq[token]: the BN lanes holding one token's outputs (aligned, one warp) sum
 // theirs by shuffles and the first adds them, so the next kernel can apply an RMSNorm without another pass.
@@ -157,7 +162,7 @@ template <int MT, int RT, int NSTEPS, int CH, bool LO, bool OUT_F32>
 __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __restrict__ x,
                                                      const __nv_bfloat16* __restrict__ w,
                                                      const __nv_bfloat16* __restrict__ wlo,
-                                                     void* __restrict__ out, int M, int N, int K, int S,
+                                                     void* __restrict__ out, int M, int ldo, int K, int S,
                                                      float* __restrict__ ssq) {
   constexpr int BN = 16 * RT, TK = 8 * MT, ELEMS = BN * TK;
   static_assert(BN == 16 || BN == 32, "a token's BN outputs are BN consecutive lanes of one warp");
@@ -175,6 +180,11 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
   // W is packed so that each warp's loads are contiguous: [tile][rank][warp][chunk][s][rt][h][lane][8].
   const size_t wwarp = ((size_t)(blockIdx.x / S) * S + rank) * 4 + warp;
 
+  // Launched with programmatic serialization: the next kernel may start now (it waits for this one before reading
+  // our output), and with one chunk this one issues its weight loads before waiting for the previous kernel (only x
+  // depends on it). With several chunks it waits first: a wait inside the chunk loop measured 15-25 % slower there.
+  griddep_launch();
+  if constexpr (CH > 1) griddep_wait();
   float acc[RT][MT][4];
 #pragma unroll
   for (int rt = 0; rt < RT; ++rt)
@@ -201,13 +211,15 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
           if constexpr (LO) lv[s][rt][h] = ld_stream(wlo + off);
         }
 
+    if constexpr (CH == 1) griddep_wait();
     uint4 xv[NSTEPS][MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
       const int tok = mt * 8 + g;
 #pragma unroll
       for (int s = 0; s < NSTEPS; ++s)
-        xv[s][mt] = tok < M ? __ldg(reinterpret_cast<const uint4*>(x + (size_t)tok * K + kw + 32 * s))
+        // L2 reads: x may come from the kernel this one overlaps, and this SM's L1 may hold the last call's.
+        xv[s][mt] = tok < M ? __ldcg(reinterpret_cast<const uint4*>(x + (size_t)tok * K + kw + 32 * s))
                             : make_uint4(0, 0, 0, 0);
     }
 
@@ -255,7 +267,7 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
       float sum = 0.f;
       if (ok)
         for (int r = 0; r < S; ++r) sum += rcv[r * EPO + li];
-      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * N + n0 + row, sum);
+      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * ldo + n0 + row, sum);
     }
   } else {
     for (int i = threadIdx.x; i < ELEMS; i += 128) rcv[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
@@ -267,7 +279,7 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
       float sum = 0.f;
       if (ok)
         for (int r = 0; r < S; ++r) sum += cluster.map_shared_rank(rcv, r)[i];
-      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * N + n0 + row, sum);
+      store_out<OUT_F32, BN>(out, ssq, ok, tok, (size_t)tok * ldo + n0 + row, sum);
     }
     cluster.sync();  // keep this CTA's shared memory alive until the others have read it
   }
@@ -276,7 +288,7 @@ __global__ void __launch_bounds__(128) skinny_kernel(const __nv_bfloat16* __rest
 template <int MT, int RT, int NSTEPS, int CH, bool LO>
 void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& wlo, torch::Tensor& out, int S,
             float* ssq) {
-  const int M = x.size(0), K = x.size(1), N = out.size(1);
+  const int M = x.size(0), K = x.size(1), N = out.size(1), ldo = out.stride(0);
   auto kernel = skinny_kernel<MT, RT, NSTEPS, CH, LO, LO>;
   static bool attr_set = false;
   if (!attr_set) {
@@ -287,22 +299,25 @@ void launch(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor&
   cfg.gridDim = dim3((N / (16 * RT)) * S);
   cfg.blockDim = dim3(128);
   cfg.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeClusterDimension;
   attr[0].val.clusterDim.x = S;
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[1].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = 2;
   cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
                      reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
-                     reinterpret_cast<const __nv_bfloat16*>(wlo.data_ptr()), out.data_ptr(), M, N, K, S, ssq);
+                     reinterpret_cast<const __nv_bfloat16*>(wlo.data_ptr()), out.data_ptr(), M, ldo, K, S, ssq);
 }
 
 void skinny(torch::Tensor x, torch::Tensor w, torch::Tensor wlo, torch::Tensor out, int64_t mt, int64_t rt,
             int64_t ns, int64_t ch, bool lo, int64_t s, torch::Tensor ssq) {
   float* sq = ssq.numel() ? ssq.data_ptr<float>() : nullptr;
   TORCH_CHECK(!sq || (!lo && ssq.numel() >= x.size(0)), "skinny: sum of squares only for BF16 outputs");
+  TORCH_CHECK(out.stride(1) == 1, "skinny: output rows must be contiguous");
 #define CASE(MT, RT, NS, CH, LO) \
   if (mt == MT && rt == RT && ns == NS && ch == CH && lo == LO) return launch<MT, RT, NS, CH, LO>(x, w, wlo, out, s, sq);
   CASES
@@ -412,7 +427,10 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
     if skinny is not None:
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        # The decode layer may pass "out": a view of its own buffer (rows of a wider, zero-padded output).
+        out = data.get("out")
+        if out is None:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
         # The decode layer passes "ssq" for the pooler: each token's sum of squares of the output is added to it.
         return _launch(x, layer, None, skinny, out, state, data.get("ssq"))
     return x @ state[layer][:n].T

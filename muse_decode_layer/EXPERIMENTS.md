@@ -61,6 +61,23 @@ timing over the 12 scored shapes (6 loads, weights 46 / 16) and the 13 tests, us
   options are off there).
 - **Submitted: job 2ef27c0f07a84d2d, 1.439× (1.417–1.461)** (from 1.425×).
 
+### L11 / L12 — fill the latency gaps between kernels (okc check, 2026-10-31)
+- Physics: at decode 1 the layer streams ~193 MB of weights (~48 µs at 4 TB/s) but took ~100 µs: ~15 kernels, many
+  latency-bound (attention, norms, routing, torch glue), each boundary ~2-3 µs of launch + first DRAM round trip.
+- L2 prefetch of the next weights (o, the pooler's first 20 MB) on a side stream during sliding attention: WORSE
+  (decode 1 / 16 / 32 sliding +10 / +9 / +25 µs). The "idle" phases are DRAM-latency-bound: extra traffic lengthens
+  their queues. Removed.
+- PDL between our kernels: the skinny GEMM triggers launch_dependents at its start and, with one chunk, issues its
+  weight loads before griddepcontrol.wait (qkv -> attention, MoE norm -> unpooler); the attention kernels read their
+  inputs, scalars and page-table rows before the wait. Up to 8 tokens the unpooler writes into a persistent
+  zero-padded buffer (no F.pad kernel). First try failed a timing recheck (residual error 0.19, repetition 5): a
+  kernel that starts early read the previous kernel's output through L1, which can hold the last replay's data.
+  Fix: L2 reads (__ldcg) for anything a PDL predecessor writes. Back-to-back A/B: 1.4802 vs L10 rerun 1.4481 (two
+  L10 reruns: 1.4455 / 1.4481); verify 1 sliding / full 173.5 / 194.8 -> 158.3 / 177.7 µs.
+  **Submitted L11: job 6dd511ae799741ff, 1.478×.**
+- L12: no remap kernel: MoE reads local_start from device memory and takes global ids (gemm1 now follows the pooler
+  directly; its x staging reads L2). A/B 1.4883 vs L11 rerun 1.4705. **Submitted: job 7a0ba34ed4ee4181, 1.496×.**
+
 ## Next
 - Full verify blocks are now the slowest shapes (1.21–1.24×): attention there is still FA3 (the CUDA kernel
   loses on q_len 8, see muse_attention_decode A8). A wgmma verify kernel would lift both problems.

@@ -5,10 +5,10 @@ Project overview, layout and lessons: [README.md](README.md). This file is the w
 ## Where things stand
 | Problem | Board | Job | Local file |
 |---|---|---|---|
-| muse_bf16_proj | 1.190× (2026-10-31) | fef2017d39ec4cc2 | muse_bf16_proj/submission.py (= submitted E14) |
+| muse_bf16_proj | 1.190× (2026-10-31) | fef2017d39ec4cc2 | board = E14 (submission_e14.py); submission.py = E14 + layer options (E15, E16) |
 | muse_moe_w4a16 | **1.704× (rank 688 of 1206)** | 069f543bb3604714 | board = M22 (submission_m22.py); submission.py = M22 + the layer's optional pre-norm (M24) |
-| muse_decode_layer | **1.439×** (2026-10-31) | 2ef27c0f07a84d2d | muse_decode_layer/submission.py (L10: pre-expert norm folded) |
-| muse_attention_decode | **1.525× (rank 754 of 1152)** | 09b49ea4276e4306 | muse_attention_decode/submission.py (A14 = submitted) |
+| muse_decode_layer | **1.496×** (2026-10-31) | 7a0ba34ed4ee4181 | muse_decode_layer/submission.py (L12: norm folded, PDL chain, no pad / remap kernels) |
+| muse_attention_decode | **1.525× (rank 754 of 1152)** | 09b49ea4276e4306 | board = A14 (submission_a14.py); submission.py = A14 + PDL for the layer (A17) |
 | overall kernel board | rank 722 of 1722 (2026-10-30 23:59 UTC) | | |
 
 Kernel track closes 2026-11-04 11:59 pm PT. Serving track (prizes) 2026-11-05 → 11-19.
@@ -24,6 +24,11 @@ after changing any of them. muse_prefill_layer is not entered.
   batching, chunk 256, CUDA full verify bs1): nothing kept. Tuning is exhausted; big levers need new kernels.
 - Layer L10: the pre-expert RMSNorm folded into the pooler (sum of squares) and MoE gemm1 (applied while staging):
   board 1.425 -> 1.439×. Needed proj E15 / MoE M24 options (off in their own problems).
+- Layer L11 / L12 (physics: fill the latency gaps): PDL chain between our kernels with weights loaded before the
+  wait, no pad / remap glue kernels: board 1.439 -> 1.478 -> 1.496×. L2 prefetch during attention made it worse
+  (latency-bound phases slow down under extra DRAM traffic). PDL hazard: read a predecessor's output with __ldcg.
+- A/B method: queue the candidate and a rerun of the current version (add a comment so it is not a cached
+  duplicate) at the same time; two reruns of the same code agree within ~0.2-0.7 %.
 
 ## 2026-10-30 (00:07–23:45 UTC): attention
 - A11: sliding decode steps in one launch (attnc: prep + attention + cluster/DSMEM merge): board 1.391 -> 1.473×.

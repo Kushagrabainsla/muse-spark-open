@@ -231,6 +231,11 @@ size 1 → every key a scattered 64-byte gather per head). Board: leader 3.03×,
 - Full decode bs1 with 256-key chunks: 27.5 -> 31.8 µs. Full verify bs1 on the CUDA kernel (attnpc) instead of FA3:
   30.9 -> 34.0 µs.
 
+### A17 — programmatic launch for the decode layer (attnc / attnpcc), 2026-10-31
+- Both kernels are launched with programmatic stream serialization, read what the previous kernel does not write
+  (scalars, page-table rows, RoPE table) before griddepcontrol.wait, then qkv with L2 loads (__ldcg). Standalone
+  check 1.5135× (A14 board 1.525×, within noise; nothing to overlap here). Used by the decode layer (L11).
+
 ## Next
 - Full verify ties FA3 now (kernel 186–195 µs vs 198 at bs16; the one-head copy floor is ~159 µs). What is left:
   the consumer chain (~1500 cycles/stage: softmax on MUFU/F2FP, two wgmma issues, barrier); options are exp2 for

@@ -14,7 +14,7 @@ than SGLang's on the same inputs. The kernel track closes **2026-11-04, 11:59 pm
 |---|---|---|---|---|---|---|
 | [muse_attention_decode](muse_attention_decode) | gated attention decode over a paged FP8 cache | **1.525×** | 754 / 1152 | 1.79× | 3.22× | 09b49ea4276e4306 |
 | [muse_moe_w4a16](muse_moe_w4a16) | routed experts, NVFP4 weights | **1.704×** | 688 / 1206 | 1.81× | 2.76× | 069f543bb3604714 |
-| [muse_decode_layer](muse_decode_layer) | the whole decoder layer | **1.439×** | 703 / 1072 | 1.66× | 2.42× | 2ef27c0f07a84d2d |
+| [muse_decode_layer](muse_decode_layer) | the whole decoder layer | **1.496×** | 703 / 1072 | 1.66× | 2.42× | 7a0ba34ed4ee4181 |
 | [muse_bf16_proj](muse_bf16_proj) | dense BF16 projections (skinny GEMMs) | **1.190×** | 1096 / 1502 | 1.24× | 1.65× | fef2017d39ec4cc2 |
 | overall kernel board | the 4 problems as one decode step | | 722 / 1722 | | | |
 
@@ -76,7 +76,9 @@ over DSMEM). Above that, cuBLAS (as SGLang), plus a split-K Triton GEMM for the 
 
 ### Decode layer (`muse_decode_layer`)
 SGLang's layer with the three kernels above swapped in. Up to 32 tokens the pre-expert RMSNorm is folded away: the
-pooler's write-out sums each token's squares and MoE gemm1 applies the norm while it stages x.
+pooler's write-out sums each token's squares and MoE gemm1 applies the norm while it stages x. Our kernels chain with
+programmatic dependent launch (each loads its weights before waiting for the previous one), and the pad / remap
+glue kernels are gone.
 
 ## Lessons worth keeping
 
@@ -89,6 +91,10 @@ pooler's write-out sums each token's squares and MoE gemm1 applies the norm whil
 - **Watch what the compiler moves.** It sank a scale load to the end of a kernel (a cold DRAM read on the critical
   path); loading all scalars up front and pinning them with an empty `asm` fixed it.
 - **Pushing beats pulling over DSMEM:** remote stores before a cluster barrier, local reads after it.
+- **Idle bandwidth is not free in a latency-bound phase.** Prefetching the next weights into L2 during attention made
+  the layer slower: the extra DRAM traffic lengthened the attention's dependent round trips.
+- **Programmatic dependent launch needs L2 reads.** A kernel that starts before its predecessor ends must read the
+  predecessor's output with `__ldcg`: its SM's L1 can still hold the last replay's data.
 - **Measure phases in the kernel** (`clock64` / `%globaltimer` per CTA): every big win came from finding the one slow
   phase. `ncu` is not available on RunPod.
 - Ideas that did not pay off are in each `EXPERIMENTS.md` (e.g. 2-head full-verify CTAs, vector atomics in MoE,
